@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------------------
+# NEVER commit these: they can contain live secret material.
+# ---------------------------------------------------------------------------
+
+# Private working folder used mid-run. The exporter deletes it on success, but
+# an interrupted run can leave raw, unredacted ARM behind.
+exports/**/.work/
+**/.work/
+
+# Only produced when output.keepRawExport = true: the unredacted export straight
+# from Azure, connection strings and keys included.
+exports/**/raw-unsanitised/
+**/raw-unsanitised/
+
+# Filled-in parameter files. The generated *.sample.* files are safe to commit;
+# a copy with real values is not.
+*.parameters.json
+!*.parameters.sample.json
+*.bicepparam
+!*.sample.bicepparam
+
+# Local config variants, which may name environments, subscriptions or tenants.
+# config/export.config.json itself IS tracked.
+config/*.local.json
+config/export.config.*.json
+!config/export.config.json
+
+# Anything a credential could land in.
+*.publishsettings
+*.pubxml
+*.pfx
+*.p12
+*.key
+*.pem
+.env
+.env.*
+!.env.example
+azureauth.json
+*.azureauth
+
+# ---------------------------------------------------------------------------
+# Generated output
+#
+# Exports are IGNORED here because this is the tool's own repo - runs against
+# real subscriptions should not land in it. To use git as a drift log, point
+# -OutputPath at a SEPARATE audit repo and use -GitCommit there. See the README,
+# "Tracking drift in git".
+# ---------------------------------------------------------------------------
+exports/
+azure-audit/
+
+# ---------------------------------------------------------------------------
+# Editor / OS / tooling noise
+# ---------------------------------------------------------------------------
+.claude/settings.local.json
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+.DS_Store

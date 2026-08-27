@@ -1,0 +1,213 @@
+{
+  "_comment": "Defaults for Export-AzResourceGroupIaC.ps1. Any script parameter you pass on the command line overrides the matching value here. Copy this file and pass -ConfigPath to keep per-environment variants.",
+
+  "mode": "Full",
+
+  "output": {
+    "path": "./exports",
+    "keepRunHistory": true,
+    "runHistoryToKeep": 20,
+    "keepRawExport": false
+  },
+
+  "resourceFilters": {
+    "_comment": "includeTypes/excludeTypes use wildcard matching against the full resource type, e.g. 'Microsoft.Storage/*'. Name patterns are regular expressions.",
+    "includeTypes": [],
+    "excludeTypes": [
+      "Microsoft.Insights/autoscalesettings",
+      "microsoft.alertsmanagement/smartDetectorAlertRules"
+    ],
+    "includeNamePattern": "",
+    "excludeNamePattern": "",
+
+    "_excludeChildTypesComment": "Child resources removed from the EXPORTED TEMPLATES (they are not top-level inventory items, so the type filters above never see them). These are provisioned automatically by Azure and cannot be meaningfully redeployed: a single Log Analytics workspace exports ~1350 built-in table schemas, which alone pushes a template past Bicep's 800-resource limit. Every removal is counted in reports/portability-report.md - clear this list if you need a byte-faithful export.",
+    "excludeChildTypes": [
+      "Microsoft.OperationalInsights/workspaces/tables",
+      "Microsoft.OperationalInsights/workspaces/savedSearches",
+      "microsoft.insights/components/ProactiveDetectionConfigs"
+    ]
+  },
+
+  "secrets": {
+    "_comment": "policy: RedactAndParameterize (secure param reference) or Placeholder (__REDACTED__ literal). failOnResidualSecret aborts the run before any artefact is written if the final text scan still finds secret-shaped values.",
+    "policy": "RedactAndParameterize",
+    "failOnResidualSecret": true,
+    "placeholder": "__REDACTED__",
+
+    "keyNamePatterns": [
+      "(?i)connectionstring",
+      "(?i)connstr",
+      "(?i)password",
+      "(?i)passphrase",
+      "(?i)secret",
+      "(?i)accountkey",
+      "(?i)^(primary|secondary)(master)?key$",
+      "(?i)sharedaccesskey",
+      "(?i)(api|access|auth|subscription|encryption|storage|instrumentation)key$",
+      "(?i)sastoken",
+      "(?i)sasurl",
+      "(?i)^token$",
+      "(?i)^credentials?$",
+      "(?i)^(pfx|cert|certificate)(blob|data|value|password)$",
+      "(?i)^privatekey$",
+      "(?i)^keyvaultsecretvalue$",
+      "(?i)^adminpassword$"
+    ],
+
+    "_allowKeyPatternsComment": "Property names that must NEVER be redacted. The first group NAME a secret rather than containing one - redacting them breaks the reference (secretRef is how Container Apps point an env var at a declared secret). The rest are usernames, public keys and type discriminators.",
+    "allowKeyPatterns": [
+      "(?i)^secretref$",
+      "(?i)^keyvaultsecretref$",
+      "(?i)^secretidentifier$",
+      "(?i)^secretstore",
+      "(?i)^administratorlogin$",
+      "(?i)^adminusername$",
+      "(?i)^(admin|administrator)?login$",
+      "(?i)^username$",
+      "(?i)publickey",
+      "(?i)thumbprint",
+      "(?i)^keydata$",
+      "(?i)^secretname$",
+      "(?i)^secreturi",
+      "(?i)^keyvault(name|uri|resourceid)$",
+      "(?i)^connectionstringtype$",
+      "(?i)^(disable|enable).*$",
+      "(?i)^.*enabled$",
+      "(?i)^certificatemode$",
+      "(?i)^passwordauthentication",
+      "(?i)^secretrotation",
+      "(?i)^tokenname$"
+    ],
+
+    "placeholderValues": ["__REDACTED__", "<SET-ME>", "", "null"],
+
+    "valuePatterns": [
+      { "name": "storage-connection-string", "pattern": "(?i)DefaultEndpointsProtocol=[^;]+;.*AccountKey=[A-Za-z0-9+/=]{20,}" },
+      { "name": "account-key",               "pattern": "(?i)AccountKey=[A-Za-z0-9+/=]{20,}" },
+      { "name": "shared-access-key",         "pattern": "(?i)SharedAccessKey=[A-Za-z0-9+/=]{20,}" },
+      { "name": "sas-signature",             "pattern": "(?i)[?&]sig=[A-Za-z0-9%+/=]{16,}" },
+      { "name": "sql-connection-password",   "pattern": "(?i)(^|;)\\s*(password|pwd)\\s*=\\s*(?![\\s'\"\\[])[^;\\s]{4,}" },
+      { "name": "user-id-password-pair",     "pattern": "(?i)User\\s*ID\\s*=[^;]+;\\s*Password\\s*=(?![\\s'\"\\[])[^;]{4,}" },
+      { "name": "redis-connection-password", "pattern": "(?i),\\s*password\\s*=\\s*(?![\\s'\"\\[])[^,\\s]{8,}" },
+      { "name": "instrumentation-key",       "pattern": "(?i)InstrumentationKey=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" },
+      { "name": "pem-private-key",           "pattern": "-----BEGIN [A-Z ]*PRIVATE KEY-----" },
+      { "name": "jwt",                       "pattern": "(?i)\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\." },
+      { "name": "bearer-token",              "pattern": "(?i)\\bBearer\\s+[A-Za-z0-9\\-._~+/]{24,}" },
+      { "name": "amqp-or-sb-endpoint-key",   "pattern": "(?i)Endpoint=sb://[^;]+;.*(SharedAccessKey|SharedAccessSignature)=[^;\\s]{16,}" }
+    ]
+  },
+
+  "portability": {
+    "_comment": "Transforms applied so the template deploys into a different RG/subscription/tenant. locationStrategy: parameter (add a 'location' param defaulted to the source region) or literal (leave regions hardcoded).",
+    "parameterizeEnvironmentIds": true,
+    "stripReadOnlyProperties": true,
+    "locationStrategy": "parameter",
+
+    "_stripReadOnlyChildIdsComment": "Inline child objects (those with their own 'name') come back carrying the 'id' Azure assigned them. That is read-only, and where it points at the enclosing resource the decompiled Bicep self-references and fails to compile (BCP079). Only stripped when the value is resource-id-shaped, so reference objects such as subnet:{id:...} - which have no sibling 'name' - are untouched.",
+    "stripReadOnlyChildIds": true,
+
+    "readOnlyProperties": [
+      "(?i)^provisioningState$",
+      "(?i)^resourceGuid$",
+      "(?i)^etag$",
+      "(?i)^creationTime$",
+      "(?i)^createdTime$",
+      "(?i)^createdDate$",
+      "(?i)^creationDate$",
+      "(?i)^lastModifiedTime$",
+      "(?i)^lastModifiedDate$",
+      "(?i)^changedTime$",
+      "(?i)^uniqueId$",
+      "(?i)^statusOfPrimary$",
+      "(?i)^statusOfSecondary$",
+      "(?i)^primaryEndpoints$",
+      "(?i)^secondaryEndpoints$",
+      "(?i)^documentEndpoint$",
+      "(?i)^defaultHostName$",
+      "(?i)^fullyQualifiedDomainName$",
+      "(?i)^outboundIpAddresses$",
+      "(?i)^possibleOutboundIpAddresses$",
+      "(?i)^inboundIpAddress$",
+      "(?i)^customDomainVerificationId$",
+      "(?i)^loginServer$",
+      "(?i)^vaultUri$",
+      "(?i)^usageState$"
+    ],
+    "_readOnlyNote": "Deliberately NOT stripped: generic names like 'state', 'status' and 'hostName' are read-only on some resource types but genuinely deployable on others, so removing them breaks more than it fixes. Add them per-environment only if you know your resource mix.",
+
+    "identityReadOnlyProperties": [
+      "(?i)^principalId$",
+      "(?i)^tenantId$",
+      "(?i)^clientId$"
+    ],
+
+    "_redundantInlineChildrenComment": "Azure exports subnets BOTH inline on the virtual network AND as standalone child resources. Decompiling that produces Bicep with a dependency cycle (BCP079/BCP080). The standalone duplicates are dropped and anything that depended on them is re-pointed at the parent, which is correct: inline children are created with it.",
+    "redundantInlineChildren": [
+      {
+        "parentType": "Microsoft.Network/virtualNetworks",
+        "childType": "Microsoft.Network/virtualNetworks/subnets",
+        "inlineProperty": "subnets"
+      }
+    ],
+
+    "_requireValueTypesComment": "Types whose secret value Azure never exports. The resource would deploy empty or fail, so it is reported as a blocking item instead.",
+    "requireValueTypes": [
+      "Microsoft.KeyVault/vaults/secrets"
+    ],
+
+    "principalIdProperties": [
+      "(?i)^principalId$",
+      "(?i)^objectId$",
+      "(?i)^applicationId$",
+      "(?i)^clientId$",
+      "(?i)^managedIdentityObjectId$"
+    ],
+
+    "globallyUniqueTypes": [
+      "Microsoft.Storage/storageAccounts",
+      "Microsoft.KeyVault/vaults",
+      "Microsoft.Web/sites",
+      "Microsoft.Web/staticSites",
+      "Microsoft.Sql/servers",
+      "Microsoft.ContainerRegistry/registries",
+      "Microsoft.DocumentDB/databaseAccounts",
+      "Microsoft.Search/searchServices",
+      "Microsoft.SignalRService/signalR",
+      "Microsoft.Cache/redis",
+      "Microsoft.EventHub/namespaces",
+      "Microsoft.ServiceBus/namespaces",
+      "Microsoft.Relay/namespaces",
+      "Microsoft.NotificationHubs/namespaces",
+      "Microsoft.ApiManagement/service",
+      "Microsoft.Network/trafficManagerProfiles",
+      "Microsoft.Cdn/profiles/endpoints",
+      "Microsoft.CognitiveServices/accounts",
+      "Microsoft.DBforPostgreSQL/*",
+      "Microsoft.DBforMySQL/*",
+      "Microsoft.ContainerService/managedClusters",
+      "Microsoft.AppConfiguration/configurationStores"
+    ]
+  },
+
+  "supplemental": {
+    "_comment": "Collected for audit and drift detection only. Not emitted as IaC: principal object ids are tenant-scoped and would fail to deploy elsewhere.",
+    "roleAssignments": true,
+    "locks": true,
+    "policyAssignments": true
+  },
+
+  "permissions": {
+    "_comment": "Produces reports/resources-and-permissions.md: every resource type reverse-engineered, and the control-plane actions needed to read them here and create them elsewhere. Actions are read from Azure's provider operation catalogue at runtime rather than hard-coded. suggestBuiltInRoles adds one catalogue-wide Get-AzRoleDefinition call to rank built-in roles by least privilege.",
+    "include": true,
+    "suggestBuiltInRoles": true
+  },
+
+  "validation": {
+    "_comment": "bicepBuild recompiles the generated Bicep to confirm the ARM -> Bicep round trip is still valid.",
+    "bicepBuild": true
+  },
+
+  "git": {
+    "autoCommit": false
+  }
+}
