@@ -801,6 +801,20 @@ Assert-Equal 'Delta'       $c['mode']                'a scalar override is appli
 Assert-Equal 'Placeholder' $c['secrets']['policy']   'a nested override is applied'
 Assert-Equal './exports'   $c['output']['path']      'a null override leaves the config value intact'
 
+Test-Group 'Config validation'
+$check = Test-RevEngConfig -Config $config
+Assert-Equal 0 $check.Errors.Count   'the shipped config has no errors'
+Assert-Equal 0 $check.Warnings.Count 'and every key in it is known (update the known-key list when adding one)'
+
+$bad = Get-RevEngExportConfig -Path (Join-Path $PSScriptRoot '../config/export.config.json')
+$bad['secrets']['failOnResidualSecrets'] = $true
+$bad['secrets']['keyNamePatterns'] = @('(?i)password', '(unclosed')
+$bad['mode'] = 'Incremental'
+$check = Test-RevEngConfig -Config $bad
+Assert-True (@($check.Warnings | Where-Object { $_ -match 'secrets\.failOnResidualSecrets' }).Count -eq 1) 'a misspelt key is reported'
+Assert-True (@($check.Errors | Where-Object { $_ -match '\(unclosed' }).Count -eq 1) 'a regex that does not compile is an error'
+Assert-True (@($check.Errors | Where-Object { $_ -match "'mode'" }).Count -eq 1) 'an invalid mode is an error'
+
 # ---------------------------------------------------------------------------
 Write-Host ''
 Write-Host ("{0} passed, {1} failed" -f $script:Pass, $script:Fail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })

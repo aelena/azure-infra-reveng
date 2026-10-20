@@ -1510,6 +1510,90 @@ function Get-RevEngExportConfig {
     return $config
 }
 
+$script:KnownConfigKeys = @{
+    ''                = @('mode', 'output', 'resourceFilters', 'secrets', 'portability', 'supplemental', 'permissions', 'validation', 'git')
+    'output'          = @('path', 'keepRunHistory', 'runHistoryToKeep', 'keepRawExport')
+    'resourceFilters' = @('includeTypes', 'excludeTypes', 'includeNamePattern', 'excludeNamePattern', 'excludeChildTypes')
+    'secrets'         = @('policy', 'failOnResidualSecret', 'placeholder', 'keyNamePatterns', 'allowKeyPatterns', 'placeholderValues', 'valuePatterns')
+    'portability'     = @('parameterizeEnvironmentIds', 'stripReadOnlyProperties', 'locationStrategy', 'stripReadOnlyChildIds',
+                          'readOnlyProperties', 'identityReadOnlyProperties', 'redundantInlineChildren', 'requireValueTypes',
+                          'parameterizeMissingSecretValues', 'principalIdProperties', 'globallyUniqueTypes')
+    'supplemental'    = @('roleAssignments', 'locks', 'policyAssignments')
+    'permissions'     = @('include', 'suggestBuiltInRoles')
+    'validation'      = @('bicepBuild')
+    'git'             = @('autoCommit')
+}
+
+function Test-RevEngConfig {
+    <#
+    .SYNOPSIS
+        Checks a loaded config before anything touches Azure.
+    .DESCRIPTION
+        An unknown key is almost always a typo, and a typo silently falls back
+        to the default - 'failOnResidualSecrets' would leave the secret gate at
+        whatever the default is. Those are warnings. Invalid enum values and
+        regular expressions that do not compile are errors: the latter would
+        otherwise only surface mid-run, after the export. Keys starting with
+        '_' are comments.
+    .OUTPUTS
+        @{ Errors = @(); Warnings = @() }
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Config)
+
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $warnings = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($section in $script:KnownConfigKeys.Keys) {
+        $node = if ($section) { Get-RevEngConfigValue -Config $Config -Path $section } else { $Config }
+        if (-not (Test-RevEngIsDictionary $node)) { continue }
+        foreach ($k in @($node.Keys)) {
+            if (([string]$k).StartsWith('_')) { continue }
+            if ($script:KnownConfigKeys[$section] -notcontains $k) {
+                $where = if ($section) { "$section.$k" } else { $k }
+                $known = $script:KnownConfigKeys[$section] -join ', '
+                $warnings.Add("Unknown config key '$where' is ignored (a typo falls back to the default). Known here: $known")
+            }
+        }
+    }
+
+    $enums = @{
+        'mode'                       = @('Full', 'Delta')
+        'secrets.policy'             = @('RedactAndParameterize', 'Placeholder')
+        'portability.locationStrategy' = @('parameter', 'literal')
+    }
+    foreach ($path in $enums.Keys) {
+        $v = Get-RevEngConfigValue -Config $Config -Path $path
+        if ($null -ne $v -and $enums[$path] -notcontains $v) {
+            $errors.Add("Config '$path' is '$v'; expected one of: $($enums[$path] -join ', ').")
+        }
+    }
+
+    $regexLists = @('secrets.keyNamePatterns', 'secrets.allowKeyPatterns', 'portability.readOnlyProperties',
+                    'portability.identityReadOnlyProperties', 'portability.principalIdProperties')
+    $regexes = [System.Collections.Generic.List[object]]::new()
+    foreach ($path in $regexLists) {
+        foreach ($p in @(Get-RevEngConfigValue -Config $Config -Path $path -Default @())) { $regexes.Add(@($path, [string]$p)) }
+    }
+    foreach ($path in @('resourceFilters.includeNamePattern', 'resourceFilters.excludeNamePattern')) {
+        $p = [string](Get-RevEngConfigValue -Config $Config -Path $path -Default '')
+        if ($p) { $regexes.Add(@($path, $p)) }
+    }
+    foreach ($vp in @(Get-RevEngConfigValue -Config $Config -Path 'secrets.valuePatterns' -Default @())) {
+        if (-not (Test-RevEngHasKey $vp 'pattern') -or -not (Test-RevEngHasKey $vp 'name')) {
+            $errors.Add("Every secrets.valuePatterns entry needs a 'name' and a 'pattern'.")
+            continue
+        }
+        $regexes.Add(@("secrets.valuePatterns[$($vp['name'])]", [string]$vp['pattern']))
+    }
+    foreach ($r in $regexes) {
+        try { $null = [regex]::new($r[1]) }
+        catch { $errors.Add("Config '$($r[0])' has an invalid regular expression '$($r[1])': $($_.Exception.InnerException.Message)") }
+    }
+
+    return @{ Errors = $errors.ToArray(); Warnings = $warnings.ToArray() }
+}
+
 # ---------------------------------------------------------------------------
 # Azure interaction
 # ---------------------------------------------------------------------------
@@ -2358,6 +2442,7 @@ Export-ModuleMember -Function @(
     'Convert-RevEngTemplateForPortability'
     'Get-RevEngExternalDependency'
     'Get-RevEngExportConfig'
+    'Test-RevEngConfig'
     'Get-RevEngBicepCli'
     'Invoke-RevEngBicep'
     'Assert-RevEngPrerequisite'

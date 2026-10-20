@@ -139,6 +139,13 @@ $overrides = @{
 # A $false override is meaningful, so strip only the nulls.
 $config = Get-RevEngExportConfig -Path $ConfigPath -Overrides $overrides
 
+# Before anything touches Azure: a bad regex would otherwise fail after the export.
+$configCheck = Test-RevEngConfig -Config $config
+foreach ($w in $configCheck.Warnings) { Write-RevEngLog $w -Level Warn }
+if ($configCheck.Errors.Count -gt 0) {
+    throw ("Invalid configuration in ${ConfigPath}:`n  - " + ($configCheck.Errors -join "`n  - "))
+}
+
 $effectiveMode   = [string](Get-RevEngConfigValue -Config $config -Path 'mode' -Default 'Full')
 $outputRoot      = [string](Get-RevEngConfigValue -Config $config -Path 'output.path' -Default './exports')
 
