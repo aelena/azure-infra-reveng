@@ -1652,8 +1652,11 @@ function Assert-RevEngPrerequisite {
 
     $problems = [System.Collections.Generic.List[string]]::new()
 
-    foreach ($m in @('Az.Accounts', 'Az.Resources')) {
-        if (-not (Get-Module -ListAvailable -Name $m)) {
+    # What matters is that the cmdlets resolve, not where they come from - which
+    # is also what lets the end-to-end suite run on a machine without Az.
+    foreach ($m in @(@{ Name = 'Az.Accounts'; Probe = 'Get-AzContext' }, @{ Name = 'Az.Resources'; Probe = 'Export-AzResourceGroup' })) {
+        if (-not (Get-Command $m.Probe -ErrorAction SilentlyContinue) -and -not (Get-Module -ListAvailable -Name $m.Name)) {
+            $m = $m.Name
             $problems.Add("PowerShell module '$m' is not installed. Run: Install-Module Az -Scope CurrentUser")
         }
     }
