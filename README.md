@@ -5,6 +5,7 @@
 [![PowerShell](https://img.shields.io/badge/PowerShell-7.3%2B-5391FE?style=flat&logo=powershell&logoColor=white)](https://github.com/PowerShell/PowerShell)
 [![Tested on](https://img.shields.io/badge/tested%20on-Linux%20%7C%20Windows-informational?style=flat)](https://github.com/aelena/azure-infra-reveng/actions/workflows/ci.yml)
 [![Output](https://img.shields.io/badge/output-ARM%20%2B%20Bicep-0078D4?style=flat&logo=microsoftazure&logoColor=white)](#output)
+[![License](https://img.shields.io/github/license/aelena/azure-infra-reveng?style=flat)](LICENSE)
 [![Read-only](https://img.shields.io/badge/Azure%20access-read--only-brightgreen?style=flat)](#credentials-what-you-actually-need)
 [![Last commit](https://img.shields.io/github/last-commit/aelena/azure-infra-reveng?style=flat)](https://github.com/aelena/azure-infra-reveng/commits/main)
 <!-- badges-end -->
@@ -432,3 +433,9 @@ The original single-resource-group exporter was verified end to end against a li
 **Not yet verified at all: that the generated templates actually deploy.** `main.bicep` compiling is a weaker claim than a successful `-WhatIfOnly` against a real target.
 
 What is planned next, and why multi-cloud lives in separate tools, is in [ROADMAP.md](ROADMAP.md).
+
+---
+
+## License
+
+[MIT](LICENSE).
