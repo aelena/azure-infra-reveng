@@ -1514,6 +1514,54 @@ function Get-RevEngExportConfig {
 # Azure interaction
 # ---------------------------------------------------------------------------
 
+function Get-RevEngBicepCli {
+    <#
+    .SYNOPSIS
+        Finds a Bicep CLI: a standalone 'bicep' on PATH, then the copy that
+        'az bicep install' keeps in ~/.azure/bin, then 'az bicep' itself.
+    .DESCRIPTION
+        The standalone binary is preferred because every 'az bicep' call starts
+        the Python-based Azure CLI first, which dominated the run time of a
+        decompile-heavy export. It also means the Azure CLI is not required.
+    .OUTPUTS
+        @{ Command = <path>; Prefix = @(...); Kind = 'standalone'|'az' }, or $null.
+    #>
+    [CmdletBinding()]
+    param([switch]$Refresh)
+
+    if ($script:BicepCli -and -not $Refresh) { return $script:BicepCli }
+    $script:BicepCli = $null
+
+    $onPath = Get-Command bicep -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    $azCopy = @('bicep.exe', 'bicep') | ForEach-Object { Join-Path $HOME ".azure/bin/$_" } |
+        Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if ($onPath) {
+        $script:BicepCli = @{ Command = $onPath.Source; Prefix = @(); Kind = 'standalone' }
+    } elseif ($azCopy) {
+        $script:BicepCli = @{ Command = $azCopy; Prefix = @(); Kind = 'standalone' }
+    } elseif (Get-Command az -ErrorAction SilentlyContinue) {
+        $null = & az bicep version 2>&1
+        if ($LASTEXITCODE -eq 0) { $script:BicepCli = @{ Command = 'az'; Prefix = @('bicep'); Kind = 'az' } }
+    }
+    return $script:BicepCli
+}
+
+function Invoke-RevEngBicep {
+    <# Runs a Bicep verb on one file with whichever CLI was found. The two CLIs
+       differ only in how the file is passed: positionally, or with --file. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('build', 'decompile')][string]$Verb,
+        [Parameter(Mandatory)][string]$File,
+        [string[]]$Arguments = @()
+    )
+    $cli = Get-RevEngBicepCli
+    if (-not $cli) { throw 'No Bicep CLI found. Install the standalone bicep CLI, or run: az bicep install' }
+    $fileArgs = if ($cli.Kind -eq 'az') { @('--file', $File) } else { @($File) }
+    $all = @($cli.Prefix) + @($Verb) + $fileArgs + $Arguments
+    return (& $cli.Command @all 2>&1)
+}
+
 function Assert-RevEngPrerequisite {
     [CmdletBinding()]
     param([switch]$RequireBicep)
@@ -1532,15 +1580,8 @@ function Assert-RevEngPrerequisite {
         $problems.Add('Not signed in to Azure. Run: Connect-AzAccount')
     }
 
-    if ($RequireBicep) {
-        if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-            $problems.Add('Azure CLI (az) not found on PATH - required for Bicep decompilation. Install: winget install Microsoft.AzureCLI')
-        } else {
-            $null = & az bicep version 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                $problems.Add('Bicep CLI not available. Run: az bicep install')
-            }
-        }
+    if ($RequireBicep -and -not (Get-RevEngBicepCli -Refresh)) {
+        $problems.Add('No Bicep CLI found - needed for Bicep output. Install the standalone CLI (winget install Microsoft.Bicep), or run: az bicep install. -SkipBicep emits ARM only.')
     }
 
     if ($problems.Count -gt 0) {
@@ -1764,7 +1805,7 @@ function Convert-RevEngArmToBicep {
     $sibling = [IO.Path]::ChangeExtension($ArmPath, '.bicep')
     if (Test-Path -LiteralPath $sibling) { Remove-Item -LiteralPath $sibling -Force }
 
-    $output = & az bicep decompile --file $ArmPath --force 2>&1
+    $output = Invoke-RevEngBicep -Verb decompile -File $ArmPath -Arguments @('--force')
     $exit = $LASTEXITCODE
 
     if (-not (Test-Path -LiteralPath $sibling)) {
@@ -1792,7 +1833,7 @@ function Test-RevEngBicepBuild {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$BicepPath)
 
-    $output = & az bicep build --file $BicepPath --stdout 2>&1
+    $output = Invoke-RevEngBicep -Verb build -File $BicepPath -Arguments @('--stdout')
     $ok = ($LASTEXITCODE -eq 0)
     $lines = (($output | Out-String) -split "`r?`n")
     return [pscustomobject]@{
@@ -2317,6 +2358,8 @@ Export-ModuleMember -Function @(
     'Convert-RevEngTemplateForPortability'
     'Get-RevEngExternalDependency'
     'Get-RevEngExportConfig'
+    'Get-RevEngBicepCli'
+    'Invoke-RevEngBicep'
     'Assert-RevEngPrerequisite'
     'Get-RevEngResourceInventory'
     'Get-RevEngPreviousState'
