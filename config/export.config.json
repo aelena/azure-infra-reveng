@@ -93,7 +93,13 @@
       { "name": "pem-private-key",           "pattern": "-----BEGIN [A-Z ]*PRIVATE KEY-----" },
       { "name": "jwt",                       "pattern": "(?i)\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\." },
       { "name": "bearer-token",              "pattern": "(?i)\\bBearer\\s+[A-Za-z0-9\\-._~+/]{24,}" },
-      { "name": "amqp-or-sb-endpoint-key",   "pattern": "(?i)Endpoint=sb://[^;]+;.*(SharedAccessKey|SharedAccessSignature)=[^;\\s]{16,}" }
+      { "name": "amqp-or-sb-endpoint-key",   "pattern": "(?i)Endpoint=sb://[^;]+;.*(SharedAccessKey|SharedAccessSignature)=[^;\\s]{16,}" },
+      { "name": "entra-client-secret",       "pattern": "(?-i)(?<![A-Za-z0-9_~.-])[A-Za-z0-9_~.-]{3}[0-9]Q~[A-Za-z0-9_~.-]{31,34}(?![A-Za-z0-9_~.-])" },
+      { "name": "github-token",              "pattern": "\\b(gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{60,})\\b" },
+      { "name": "aws-access-key-id",         "pattern": "(?-i)\\b(AKIA|ASIA)[0-9A-Z]{16}\\b" },
+      { "name": "slack-token",               "pattern": "\\bxox[abposr]-[A-Za-z0-9-]{10,}" },
+      { "name": "google-api-key",            "pattern": "(?-i)\\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])" },
+      { "name": "llm-api-key",               "pattern": "(?-i)\\bsk-(proj-|ant-api\\d\\d-)?(?=[A-Za-z0-9_-]*[0-9])(?=[A-Za-z0-9_-]*[A-Z])[A-Za-z0-9_-]{32,}" }
     ]
   },
 

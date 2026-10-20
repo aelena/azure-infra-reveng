@@ -326,6 +326,26 @@ Assert-True $v.IsSecret 'but the matching admin password still is'
 $v = Get-RevEngSecretVerdict -Name 'someUrl' -Value 'https://x.blob.core.windows.net/c?sv=2022-11-02&sig=aBcDeFgHiJkLmNoPqRsTuV%2FwXyZ0123456789ab%3D' -SecretConfig $secrets
 Assert-True $v.IsSecret 'a SAS URL is caught by value shape even under an innocuous property name'
 
+# Third-party credentials that end up in app settings, under innocuous names.
+# Assembled at runtime so this file itself never holds a token-shaped literal.
+$shapes = [ordered]@{
+    'entra-client-secret' = 'abc8Q~' + ('Xy1_' * 8) + 'Zq'
+    'github-token'        = 'ghp_' + ('aB3d' * 9)
+    'aws-access-key-id'   = 'AKIA' + 'IOSFODNN7EXAMPLE'
+    'slack-token'         = 'xoxb-' + '1234567890-abcdefghij'
+    'google-api-key'      = 'AIza' + ('Sy0_' * 8) + 'abc'
+    'llm-api-key'         = 'sk-proj-' + ('Ab3' * 12)
+}
+foreach ($kind in $shapes.Keys) {
+    $v = Get-RevEngSecretVerdict -Name 'SETTING_VALUE' -Value $shapes[$kind] -SecretConfig $secrets
+    Assert-Equal "value-shape:$kind" $v.Reason "a $kind is caught by value shape"
+}
+foreach ($benign in @('sk-production-environment-west-europe-01', 'AKIA-not-a-key', 'xoxo', 'https://github.com/org/repo',
+                      '3fa85f64-5717-4562-b3fc-2c963f66afa6', 'Standard_LRS', 'Microsoft.Web/sites/config')) {
+    $v = Get-RevEngSecretVerdict -Name 'SETTING_VALUE' -Value $benign -SecretConfig $secrets
+    Assert-False $v.IsSecret "'$benign' is not mistaken for a credential"
+}
+
 # ---------------------------------------------------------------------------
 Test-Group 'Secret redaction end to end'
 $templateJson = @"
