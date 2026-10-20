@@ -19,19 +19,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install the Bicep CLI (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          curl -sSLo /usr/local/bin/bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
-          chmod +x /usr/local/bin/bicep
-          bicep --version
-
-      - name: Install the Bicep CLI (Windows)
-        if: runner.os == 'Windows'
+      # The standalone binary, into a runner-owned folder: system paths are not
+      # writable on every image, and 'az bicep install' locations vary.
+      - name: Install the Bicep CLI
         shell: pwsh
         run: |
-          az bicep install
-          & "$HOME/.azure/bin/bicep.exe" --version
+          $bin = Join-Path $env:RUNNER_TEMP 'bicep-bin'
+          New-Item -ItemType Directory -Path $bin -Force | Out-Null
+          $asset = if ($IsWindows) { 'bicep-win-x64.exe' } else { 'bicep-linux-x64' }
+          $exe = Join-Path $bin $(if ($IsWindows) { 'bicep.exe' } else { 'bicep' })
+          Invoke-WebRequest "https://github.com/Azure/bicep/releases/latest/download/$asset" -OutFile $exe
+          if (-not $IsWindows) { chmod +x $exe }
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+          & $exe --version
 
       - name: Unit tests (no Azure)
         shell: pwsh
