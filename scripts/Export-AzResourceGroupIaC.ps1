@@ -843,7 +843,7 @@ if ($mainNote) {
 $sm.Add('## Next steps')
 $sm.Add('')
 $sm.Add('1. Read `reports/portability-report.md` - blocking items first.')
-$sm.Add('2. Copy `bicep/main.parameters.sample.json` (or `main.sample.bicepparam`), replace every `<SET-ME>`, and override globally unique names.')
+$sm.Add('2. Copy `arm/main.parameters.sample.json` to `arm/main.parameters.json` (git-ignored), replace every non-secret `<SET-ME>` and override globally unique names. Leave secure parameters as `<SET-ME>`: the deploy helper prompts for them.')
 $sm.Add('3. Dry run: `./deploy/Deploy-Target.ps1 -ResourceGroupName <target-rg> -Location <region> -WhatIfOnly`.')
 $sm.Add('4. Re-run this exporter with `-Mode Delta` on a schedule to catch drift.')
 $sm.Add('')

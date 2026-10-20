@@ -1204,6 +1204,7 @@ function Convert-RevEngTemplateForPortability {
     $identityReadOnly = @(Get-RevEngConfigValue -Config $PortabilityConfig -Path 'identityReadOnlyProperties' -Default @())
     $principalPatterns = @(Get-RevEngConfigValue -Config $PortabilityConfig -Path 'principalIdProperties' -Default @())
     $globallyUnique = @(Get-RevEngConfigValue -Config $PortabilityConfig -Path 'globallyUniqueTypes' -Default @())
+    $parameterizeMissing = [bool](Get-RevEngConfigValue -Config $PortabilityConfig -Path 'parameterizeMissingSecretValues' -Default $true)
 
     $quote = [string][char]0x27
     $replacements = @()
@@ -1351,16 +1352,34 @@ function Convert-RevEngTemplateForPortability {
                 foreach ($vt in @(Get-RevEngConfigValue -Config $PortabilityConfig -Path 'requireValueTypes' -Default @())) {
                     if ($context.ResourceType -ine ([string]$vt)) { continue }
                     $hasValue = (Test-RevEngHasKey $res 'properties') -and (Test-RevEngHasKey $res['properties'] 'value')
-                    if (-not $hasValue) {
-                        $findings.Add([pscustomobject]@{
-                            Severity     = 'Action required'
-                            Category     = 'Secret value not exported'
-                            ResourceName = $context.ResourceName
-                            ResourceType = $context.ResourceType
-                            Path         = "resources[$i]"
-                            Detail       = 'Azure does not export secret values, so this resource has no value to deploy. Supply it at deploy time (Key Vault reference or a secure parameter) or remove the resource from the template.'
-                        })
+                    if ($hasValue) { continue }
+
+                    $detail = 'Azure does not export secret values, so this resource has no value to deploy. Supply it at deploy time (Key Vault reference or a secure parameter) or remove the resource from the template.'
+                    if ($parameterizeMissing) {
+                        # Wire the value to a secure parameter, so the template
+                        # deploys once it is supplied instead of creating an
+                        # empty secret. Deploy-Target.ps1 prompts for it.
+                        if (-not (Test-RevEngHasKey $template 'parameters')) { $template['parameters'] = New-RevEngOrderedMap }
+                        $base = ConvertTo-RevEngParameterName -Name ('secretvalue_' + $context.ResourceName)
+                        $paramName = $base
+                        $k = 2
+                        while ($template['parameters'].Contains($paramName)) { $paramName = '{0}_{1}' -f $base, $k; $k++ }
+                        $template['parameters'][$paramName] = New-RevEngOrderedMap @{
+                            type     = 'securestring'
+                            metadata = New-RevEngOrderedMap @{ description = "Value of $($context.ResourceName) ($($context.ResourceType)). Azure never exports it; supply it at deploy time." }
+                        }
+                        if (-not (Test-RevEngHasKey $res 'properties')) { $res['properties'] = New-RevEngOrderedMap }
+                        $res['properties']['value'] = "[parameters('$paramName')]"
+                        $detail = "Azure does not export secret values. The value is now the secure parameter ``$paramName`` - supply it at deploy time (Deploy-Target.ps1 prompts for it), or remove the resource from the template."
                     }
+                    $findings.Add([pscustomobject]@{
+                        Severity     = 'Action required'
+                        Category     = 'Secret value not exported'
+                        ResourceName = $context.ResourceName
+                        ResourceType = $context.ResourceType
+                        Path         = "resources[$i]"
+                        Detail       = $detail
+                    })
                 }
 
                 foreach ($gu in $globallyUnique) {
@@ -1963,6 +1982,7 @@ function New-RevEngParameterFile {
         $lines.Add("using ${q}${BicepTemplateName}${q}")
         $lines.Add('')
         $lines.Add('// Values marked <SET-ME> must be supplied for the target environment.')
+        $lines.Add('// Copy this file to main.bicepparam (git-ignored) before filling it in.')
         $lines.Add('// Prefer Key Vault for secrets, e.g.:')
         $lines.Add('//   param mySecret = az.getSecret(<subId>, <rg>, <vaultName>, <secretName>)')
         $lines.Add('')
@@ -1998,6 +2018,16 @@ function New-RevEngDeployScript {
     starting point, not a guarantee: globally unique names, tenant-scoped
     principal ids and regional SKU availability all need review first. See
     ../reports/portability-report.md.
+
+    Parameters come from arm/main.parameters.json (or bicep/main.parameters.json):
+    copy main.parameters.sample.json to that name - it is git-ignored, the
+    sample is not - and fill in every non-secret <SET-ME>. Leave the SECURE
+    parameters as <SET-ME>: you are prompted for them, and their values are
+    held in memory only, never written to disk.
+
+    The ARM template is deployed by default because it is the exact output of
+    the exporter; the Bicep is a best-effort decompilation. -UseBicep deploys
+    the Bicep instead (Az PowerShell needs the standalone 'bicep' CLI on PATH).
 .EXAMPLE
     ./Deploy-Target.ps1 -ResourceGroupName rg-target -Location westeurope -WhatIfOnly
 .EXAMPLE
@@ -2012,13 +2042,57 @@ param(
     [string]$TenantId,
     [string]$TemplateFile,
     [string]$ParameterFile,
+    [switch]$UseBicep,
     [switch]$WhatIfOnly
 )
 
 $ErrorActionPreference = 'Stop'
+$sentinel = '<SET-ME>'
+$root = Split-Path -Parent $PSScriptRoot
 
-if (-not $TemplateFile)  { $TemplateFile  = Join-Path $PSScriptRoot '../bicep/main.bicep' }
-if (-not $ParameterFile) { $ParameterFile = Join-Path $PSScriptRoot '../bicep/main.parameters.sample.json' }
+if (-not $TemplateFile) {
+    $TemplateFile = if ($UseBicep) { Join-Path $root 'bicep/main.bicep' } else { Join-Path $root 'arm/main.json' }
+}
+if (-not (Test-Path -LiteralPath $TemplateFile)) { throw "Template not found: $TemplateFile" }
+if ($TemplateFile -like '*.bicep' -and -not (Get-Command bicep -ErrorAction SilentlyContinue)) {
+    throw "Deploying Bicep needs the standalone 'bicep' CLI on PATH ('az bicep install' does not put it there). Install it, or deploy the ARM template by omitting -UseBicep."
+}
+
+if (-not $ParameterFile) {
+    $ParameterFile = @((Join-Path $root 'arm/main.parameters.json'), (Join-Path $root 'bicep/main.parameters.json')) |
+        Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $ParameterFile) {
+        throw ("No parameter file. Copy arm/main.parameters.sample.json to arm/main.parameters.json (git-ignored) " +
+               "and fill in every non-secret $sentinel. Secure parameters can stay $sentinel - you will be prompted for them.")
+    }
+}
+
+# Secure parameters are known from the ARM template's declarations, which
+# exist even when the Bicep is what is being deployed.
+$armForTypes = if ($TemplateFile -like '*.json') { $TemplateFile } else { Join-Path $root 'arm/main.json' }
+$declared = @{}
+if (Test-Path -LiteralPath $armForTypes) {
+    $armParams = (Get-Content -LiteralPath $armForTypes -Raw | ConvertFrom-Json -AsHashtable -Depth 64)['parameters']
+    if ($armParams) { foreach ($k in $armParams.Keys) { $declared[$k] = [string]$armParams[$k]['type'] } }
+}
+
+$values = @{}
+$fileParams = (Get-Content -LiteralPath $ParameterFile -Raw | ConvertFrom-Json -AsHashtable -Depth 64)['parameters']
+if ($fileParams) { foreach ($k in $fileParams.Keys) { $values[$k] = $fileParams[$k]['value'] } }
+
+$isUnset = { param($v) $v -is [string] -and $v -eq $sentinel }
+$missing = @($values.Keys | Where-Object { (& $isUnset $values[$_]) -and $declared[$_] -notmatch '(?i)^secure' } | Sort-Object)
+if ($missing.Count -gt 0) {
+    throw "Parameter file '$ParameterFile' still has $sentinel for non-secret parameter(s): $($missing -join ', '). Fill them in first."
+}
+
+foreach ($k in @($values.Keys | Sort-Object)) {
+    if (-not (& $isUnset $values[$k])) { continue }
+    $secure = Read-Host -AsSecureString "Value for secure parameter '$k'"
+    $plain = [System.Net.NetworkCredential]::new('', $secure).Password
+    if ([string]::IsNullOrEmpty($plain)) { throw "No value given for secure parameter '$k'." }
+    $values[$k] = $plain
+}
 
 if ($TenantId -and $SubscriptionId) {
     Connect-AzAccount -TenantId $TenantId -Subscription $SubscriptionId | Out-Null
@@ -2026,20 +2100,20 @@ if ($TenantId -and $SubscriptionId) {
     Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
 }
 
-if ((Get-Content -LiteralPath $ParameterFile -Raw) -match '<SET-ME>') {
-    throw "Parameter file '$ParameterFile' still contains <SET-ME> placeholders. Fill them in (secrets included) before deploying."
-}
-
 if (-not (Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyContinue)) {
     if (-not $Location) { throw 'Target resource group does not exist - pass -Location so it can be created.' }
+    if ($WhatIfOnly) {
+        Write-Host "Target resource group '$ResourceGroupName' does not exist; what-if needs it. Create it first, or run without -WhatIfOnly." -ForegroundColor Yellow
+        return
+    }
     New-AzResourceGroup -Name $ResourceGroupName -Location $Location | Out-Null
 }
 
 $splat = @{
-    ResourceGroupName     = $ResourceGroupName
-    TemplateFile          = $TemplateFile
-    TemplateParameterFile = $ParameterFile
-    Mode                  = 'Incremental'
+    ResourceGroupName       = $ResourceGroupName
+    TemplateFile            = $TemplateFile
+    TemplateParameterObject = $values
+    Mode                    = 'Incremental'
 }
 
 Write-Host 'Running what-if...' -ForegroundColor Cyan

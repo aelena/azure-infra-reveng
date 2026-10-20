@@ -290,6 +290,44 @@ try {
     Assert-That (-not ($pr -match $global:SecretPassword))              'the permissions report leaks no secret'
 
     # -----------------------------------------------------------------------
+    Write-Host "`n=== Deploy helper, against a mocked deployment ===" -ForegroundColor Magenta
+    $deploy = Join-Path $rgOut 'deploy/Deploy-Target.ps1'
+    $global:Deployments = [System.Collections.Generic.List[object]]::new()
+    function global:New-AzResourceGroupDeployment {
+        param([string]$ResourceGroupName, [string]$TemplateFile, [hashtable]$TemplateParameterObject, [string]$Mode,
+              [string]$Name, [switch]$WhatIf, [Parameter(ValueFromRemainingArguments)]$Rest)
+        $global:Deployments.Add([pscustomobject]@{ TemplateFile = $TemplateFile; Parameters = $TemplateParameterObject; WhatIf = [bool]$WhatIf })
+    }
+    function global:Read-Host {
+        param([Parameter(Position = 0)]$Prompt, [switch]$AsSecureString)
+        ConvertTo-SecureString 'typed-at-the-prompt' -AsPlainText -Force
+    }
+
+    $refused = $null
+    try { & $deploy -ResourceGroupName rg-target -WhatIfOnly | Out-Null } catch { $refused = $_.Exception.Message }
+    Assert-That ($refused -match 'No parameter file')                     'without a filled-in parameter file the helper refuses, rather than use the tracked sample'
+
+    $filled = Join-Path $rgOut 'arm/main.parameters.json'
+    Copy-Item (Join-Path $rgOut 'arm/main.parameters.sample.json') $filled
+    & $deploy -ResourceGroupName rg-target -WhatIfOnly | Out-Null
+    $call = $global:Deployments | Select-Object -Last 1
+    Assert-That ($global:Deployments.Count -eq 1 -and $call.WhatIf)      'with -WhatIfOnly exactly one what-if runs and nothing is deployed'
+    Assert-That ($call.TemplateFile -like '*arm*main.json')               'the exact ARM output is deployed by default, not the decompiled Bicep'
+    $secureNames = @((Get-Content (Join-Path $rgOut 'arm/main.json') -Raw | ConvertFrom-Json -AsHashtable)['parameters'].GetEnumerator() |
+        Where-Object { $_.Value['type'] -eq 'securestring' } | ForEach-Object Key)
+    Assert-That ($secureNames.Count -gt 0 -and @($secureNames | Where-Object { $call.Parameters[$_] -ne 'typed-at-the-prompt' }).Count -eq 0) 'secure parameters left as <SET-ME> are prompted for'
+    Assert-That (-not ((Get-Content $filled -Raw) -match 'typed-at-the-prompt')) 'and the prompted value is never written to the parameter file'
+
+    $pf = Get-Content $filled -Raw | ConvertFrom-Json -AsHashtable
+    $pf['parameters'][@($pf['parameters'].Keys | Where-Object { $_ -notin $secureNames })[0]]['value'] = '<SET-ME>'
+    $pf | ConvertTo-Json -Depth 32 | Set-Content $filled
+    $refused = $null
+    try { & $deploy -ResourceGroupName rg-target -WhatIfOnly | Out-Null } catch { $refused = $_.Exception.Message }
+    Assert-That ($refused -match 'non-secret')                            'a non-secret <SET-ME> is refused instead of prompted for'
+    Remove-Item $filled
+    Remove-Item function:global:New-AzResourceGroupDeployment, function:global:Read-Host
+
+    # -----------------------------------------------------------------------
     Write-Host "`n=== RUN 2: delta, with a change and a deletion ===" -ForegroundColor Magenta
     $global:MockSalt = 'v2-changed'
     $global:MockResources = @($global:MockResources | Where-Object { $_.Name -ne 'sql-e2e' })

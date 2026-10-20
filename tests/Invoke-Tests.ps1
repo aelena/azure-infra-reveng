@@ -418,6 +418,26 @@ Assert-True ($port.Template['parameters'].Contains('location')) 'the location pa
 Assert-True (@($port.Findings | Where-Object { $_.Category -eq 'Environment identifier' }).Count -gt 0) 'rewrites are reported'
 Assert-True ($port.Template['resources'][0]['identity'].Contains('type')) 'the deployable identity.type survives stripping'
 
+# Azure never exports a Key Vault secret's value: without one the resource
+# deploys an empty secret or fails, so the value becomes a secure parameter.
+$kvTemplate = @'
+{ "resources": [
+  { "type": "Microsoft.KeyVault/vaults/secrets", "name": "[concat(parameters('vaults_kv1_name'), '/db-password')]",
+    "properties": { "attributes": { "enabled": true } } },
+  { "type": "Microsoft.KeyVault/vaults/secrets", "name": "[concat(parameters('vaults_kv1_name'), '/has-value')]",
+    "properties": { "value": "[parameters('existing')]" } }
+] }
+'@
+$kv = Convert-RevEngTemplateForPortability -Template ($kvTemplate | ConvertFrom-Json -AsHashtable -Depth 32) -PortabilityConfig $portability
+Assert-Equal "[parameters('secretvalue_vaults_kv1_db_password')]" $kv.Template['resources'][0]['properties']['value'] 'a Key Vault secret with no exported value is wired to a secure parameter'
+Assert-Equal 'securestring' $kv.Template['parameters']['secretvalue_vaults_kv1_db_password']['type'] 'and that parameter is declared secure'
+Assert-Equal "[parameters('existing')]" $kv.Template['resources'][1]['properties']['value'] 'a secret that already has a value is left alone'
+Assert-Equal 1 @($kv.Findings | Where-Object Category -eq 'Secret value not exported').Count 'it is still reported as a blocking item'
+
+$noParam = $portability.Clone(); $noParam['parameterizeMissingSecretValues'] = $false
+$kvOff = Convert-RevEngTemplateForPortability -Template ($kvTemplate | ConvertFrom-Json -AsHashtable -Depth 32) -PortabilityConfig $noParam
+Assert-False ($kvOff.Template['resources'][0]['properties'].Contains('value')) 'parameterisation can be switched off'
+
 # Real exports carry references to resources outside the exported set as
 # '<type>_<name>_externalid' parameters with a literal resource id default.
 $withExternal = @"

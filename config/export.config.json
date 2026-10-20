@@ -150,10 +150,11 @@
       }
     ],
 
-    "_requireValueTypesComment": "Types whose secret value Azure never exports. The resource would deploy empty or fail, so it is reported as a blocking item instead.",
+    "_requireValueTypesComment": "Types whose secret value Azure never exports. The resource would deploy empty or fail, so it is reported as a blocking item. With parameterizeMissingSecretValues each one's value is also wired to a new secure parameter, which deploy/Deploy-Target.ps1 prompts for - the value never has to be written to disk.",
     "requireValueTypes": [
       "Microsoft.KeyVault/vaults/secrets"
     ],
+    "parameterizeMissingSecretValues": true,
 
     "principalIdProperties": [
       "(?i)^principalId$",
