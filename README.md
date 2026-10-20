@@ -1,17 +1,17 @@
 # azure-infra-reveng
 
-Reverse-engineers an existing Azure Resource Group into **ARM and Bicep templates that can redeploy the same resources into another resource group, subscription or tenant** — with secrets stripped out into secure parameters, a report of everything that still needs a human decision, and drift detection between runs.
+Reverse-engineers existing Azure resource groups into **ARM and Bicep templates that can redeploy the same resources into another resource group, subscription or tenant** — with secrets stripped out into secure parameters, a report of everything that still needs a human decision, and drift detection between runs.
 
-Built to be run straight from a PowerShell IDE. One script, one config file, no state outside the output folder.
+Built to be run straight from a PowerShell IDE, or unattended from a pipeline. Two scripts, one config file, no state outside the output folder.
 
 | Goal | How |
 |---|---|
-| **Document** infrastructure as code | Sanitised ARM + Bicep per resource, plus one deployable whole-RG template |
-| **Replicate** it elsewhere | Environment identifiers become runtime expressions; secrets and unique names become parameters; a `Deploy-Target.ps1` helper does a what-if first |
-| **Detect drift** | Every resource fingerprinted and diffed against the previous run — new / modified / removed / unknown — at two levels |
+| **Document** infrastructure as code | Sanitised ARM + Bicep per resource (children included), plus one deployable whole-RG template |
+| **Replicate** it elsewhere | Environment identifiers become runtime expressions; secrets, Key Vault secret values and unique names become parameters; a `Deploy-Target.ps1` helper does a what-if first and prompts for secrets instead of reading them from disk |
+| **Detect drift** | Every resource fingerprinted and diffed against the previous run — new / modified / removed / unknown — at two levels, with an exit code a scheduled job can gate on |
 | **Plan access** | A report of every resource type found and the permissions needed to read it here and create it elsewhere |
 
-**It never writes to Azure.** Every call is `Get-Az*` plus `Export-AzResourceGroup`, which only serialises a template. Nothing is created, modified or deleted.
+**It never writes to Azure.** Every call is `Get-Az*` plus `Export-AzResourceGroup`, which only serialises a template. Nothing is created, modified or deleted. (The generated deploy helper does write — to the *target*, after a what-if and a typed confirmation.)
 
 ---
 
@@ -50,7 +50,7 @@ $cred = [pscredential]::new($env:AZURE_CLIENT_ID,
 Connect-AzAccount -ServicePrincipal -Credential $cred -Tenant $env:AZURE_TENANT_ID
 ```
 
-In Azure Pipelines, prefer an **ARM service connection with workload identity federation** and the `AzurePowerShell@5` task — no secret exists to leak:
+Prefer **workload identity federation** where your CI supports it — no secret exists to leak. In GitHub Actions that is `azure/login` with OIDC; in Azure Pipelines an ARM service connection with the `AzurePowerShell@5` task:
 
 ```yaml
 - task: AzurePowerShell@5
@@ -58,7 +58,7 @@ In Azure Pipelines, prefer an **ARM service connection with workload identity fe
     azureSubscription: <your-service-connection>
     ScriptType: filePath
     ScriptPath: scripts/Export-AzResourceGroupIaC.ps1
-    ScriptArguments: -ResourceGroupName <rg> -OutputPath $(Build.ArtifactStagingDirectory)/export
+    ScriptArguments: -ResourceGroupName <rg> -OutputPath $(Build.ArtifactStagingDirectory)/export -Mode Delta -FailOnDrift
     azurePowerShellVersion: LatestVersion
 ```
 
@@ -85,11 +85,10 @@ Every run writes `reports/resources-and-permissions.md` with the actual per-type
 
 ```powershell
 Install-Module Az -Scope CurrentUser -Repository PSGallery -Force
-winget install Microsoft.AzureCLI      # provides `az`, needed only for Bicep
-az bicep install
+winget install Microsoft.Bicep          # standalone Bicep CLI, needed only for Bicep output
 ```
 
-PowerShell **7.3+**, `Az.Accounts` and `Az.Resources`. The Azure CLI with Bicep is needed only for Bicep output — `-SkipBicep` drops that dependency and emits ARM alone.
+PowerShell **7.3+**, `Az.Accounts` and `Az.Resources`. A Bicep CLI is needed only for Bicep output; `-SkipBicep` drops that dependency and emits ARM alone. The exporter looks for a standalone `bicep` on `PATH`, then the copy `az bicep install` keeps in `~/.azure/bin`, then falls back to `az bicep` — so an existing Azure CLI setup works, but the Azure CLI is no longer required, and the standalone binary is several times faster.
 
 ---
 
@@ -99,7 +98,7 @@ PowerShell **7.3+**, `Az.Accounts` and `Az.Resources`. The Azure CLI with Bicep 
 git clone https://github.com/aelena/azure-infra-reveng.git
 cd azure-infra-reveng
 
-./tests/Invoke-Tests.ps1                       # ~2s, no Azure at all - proves the toolchain
+./tests/Invoke-Tests.ps1                       # a few seconds, no Azure at all - proves the toolchain
 
 Connect-AzAccount
 ./scripts/Export-AzResourceGroupIaC.ps1 -ResourceGroupName <rg> -OutputPath 'C:\temp\azure-audit'
@@ -109,7 +108,7 @@ Then read `C:\temp\azure-audit\<rg>\reports\summary.md`.
 
 ### Where to send the output
 
-**Keep it out of a synced folder for the first run.** Mid-run the raw, *unredacted* export sits in a `.work/` folder before redaction. It is deleted on success, but OneDrive or Dropbox can upload it in that window. The script warns if it detects one; `.gitignore` excludes it regardless.
+**Keep it out of a synced folder for the first run.** Mid-run the raw, *unredacted* export sits in a `.work/` folder before redaction. It is deleted on success, but OneDrive or Dropbox can upload it in that window. The script warns if it detects one; the output folder's own `.gitignore` and this repo's `.gitignore` both exclude it regardless.
 
 `-OutputPath` accepts an absolute path. If relative: omitted (so the config default `./exports` applies) it resolves against the **repo root**; passed explicitly it resolves against your **current directory**. The resolved path is printed as `Output :` in the first few lines.
 
@@ -118,7 +117,7 @@ Then read `C:\temp\azure-audit\<rg>\reports\summary.md`.
 ## Running it
 
 ```powershell
-# Everything
+# Everything in one resource group
 ./scripts/Export-AzResourceGroupIaC.ps1 -ResourceGroupName rg-prod -OutputPath 'C:\repos\infra-audit'
 
 # Only what changed since last time - the drift check
@@ -130,34 +129,70 @@ Then read `C:\temp\azure-audit\<rg>\reports\summary.md`.
 # Cross-subscription, committing each run to an audit repo
 ./scripts/Export-AzResourceGroupIaC.ps1 -ResourceGroupName rg-prod `
     -SubscriptionId <sub-id> -OutputPath 'C:\repos\infra-audit' -GitCommit
+
+# Every resource group in the subscription, as a nightly drift gate
+./scripts/Export-AzSubscriptionIaC.ps1 -ResourceGroupName 'rg-prod-*' -Mode Delta `
+    -OutputPath 'C:\repos\infra-audit' -GitCommit -FailOnDrift
 ```
 
-### Parameters
+### Parameters — `Export-AzResourceGroupIaC.ps1`
 
 | Parameter | Default | Purpose |
 |---|---|---|
 | `-ResourceGroupName` | *required* | Source RG to reverse-engineer |
 | `-SubscriptionId` | current context | Switch subscription before running |
-| `-Mode` | `Full` | `Full` = every in-scope resource; `Delta` = only new/changed since last run |
+| `-Mode` | `Full` | `Full` = rewrite every per-resource file; `Delta` = only those whose resource changed since last run |
 | `-OutputPath` | `./exports` | Root output folder (a subfolder per RG is created) |
 | `-ConfigPath` | `config/export.config.json` | Use a different config file |
 | `-TargetLocation` | — | Also check resource-type availability in that region |
 | `-SecretPolicy` | `RedactAndParameterize` | Or `Placeholder` |
 | `-AllowResidualSecrets` | off | Downgrade the secret gate from failure to warning |
-| `-SkipBicep` | off | ARM only, no Azure CLI needed |
+| `-SkipBicep` | off | ARM only, no Bicep CLI needed |
 | `-SkipPermissionReport` | off | Skip the resource types and permissions report |
 | `-SkipRoleAssignments`, `-SkipLocks`, `-SkipPolicies` | off | Skip audit-only collection |
-| `-GitCommit` | off | Commit the run locally (never pushes) |
+| `-GitCommit` | off | Commit this RG's folder locally (never pushes, never stages anything else) |
+| `-FailOnDrift` | off | Exit `3` when anything was added, changed or removed since the previous run |
 
 Any parameter overrides the matching config value; anything omitted keeps the file's value.
+
+### Parameters — `Export-AzSubscriptionIaC.ps1`
+
+Runs the exporter above once per matching resource group — each with its own folder, state and drift history, exactly as if run alone — and writes `<OutputPath>/subscription-summary.md` and `.json`.
+
+| Parameter | Default | Purpose |
+|---|---|---|
+| `-ResourceGroupName` | `*` | Names or wildcards to include |
+| `-ExcludeResourceGroupName` | `NetworkWatcherRG`, `DefaultResourceGroup-*`, `cloud-shell-storage-*`, `AzureBackupRG*` | Names or wildcards to skip |
+| `-IncludeManaged` | off | Also export resource groups with a `ManagedBy` owner (AKS `MC_*` node groups, Databricks, managed apps). Skipped by default: their owner recreates their contents |
+| *every exporter option* | | Forwarded unchanged (`-Mode`, `-OutputPath`, `-GitCommit`, `-FailOnDrift`, `-SkipBicep`, …) |
 
 ### Exit codes
 
 | Code | Meaning |
 |---|---|
 | `0` | Clean |
-| `1` | Completed with issues — an export failure, Bicep that does not compile, or secrets allowed through. Artefacts were still written |
-| `2` | Aborted — prerequisites failed, the secret gate fired, or an unhandled error |
+| `1` | Completed with issues — an export failure, Bicep that does not decompile or compile, resources that could not be fingerprinted, or secrets allowed through. Artefacts were still written |
+| `2` | Aborted — invalid config, prerequisites failed, the secret gate fired, or an unhandled error |
+| `3` | Drift found, and `-FailOnDrift` was given. Takes precedence over `1`; `summary.json` lists any issues either way |
+
+The subscription wrapper exits with the most severe code across its resource groups (`2` > `3` > `1` > `0`). Every run writes `reports/summary.json` with the same outcome, counts and issue list, so a pipeline never has to parse markdown.
+
+---
+
+## How a run works
+
+1. Validate the config and prerequisites — before anything touches Azure.
+2. Inventory the resource group and fingerprint every resource.
+3. Diff against the previous run's `state.json`.
+4. **Export the whole resource group once** into a private `.work/` folder.
+5. Normalise, redact secrets, rewrite environment identifiers — once, in memory.
+6. Hard-gate on any secret-shaped text left in the rendered result.
+7. Write `main.json`, then **cut the per-resource files out of it locally**, and decompile everything to Bicep.
+8. Write the parameter files, the deploy helper and the reports; persist state; optionally commit.
+
+Step 7 is what makes a run cheap: there is one ARM export operation per resource group, not one per resource, and nothing is processed twice. Each per-resource file carries its child resources (a Key Vault's file includes its secrets and access policies) and exactly the parameters and variables it references. `dependsOn` entries pointing at another file are dropped from that file's copy, so the standalone Bicep has no dangling symbols; `main.json` keeps them all.
+
+**When Azure refuses the whole-RG export** — it fails the entire export on any type it cannot serialise — each resource is probed on its own to find the culprits, and the export is retried without them. If even that fails (for example, past the export size limit), the successful probes are merged into `main.json`, and the summary says so.
 
 ---
 
@@ -165,12 +200,13 @@ Any parameter overrides the matching config value; anything omitted keeps the fi
 
 ```
 <OutputPath>/<resource-group>/
+  .gitignore                         # keeps .work/, raw-unsanitised/ and filled-in parameter files out of git
   arm/
     main.json                        # whole RG, deployable
     main.parameters.sample.json
-    resources/<type>_<name>.json     # one per resource, for review
+    resources/<type>_<name>.json     # one per top-level resource, children included
   bicep/
-    main.bicep                       # whole RG, deployable
+    main.bicep                       # whole RG
     main.parameters.sample.json
     main.sample.bicepparam
     resources/<type>_<name>.bicep
@@ -178,6 +214,7 @@ Any parameter overrides the matching config value; anything omitted keeps the fi
     Deploy-Target.ps1                # what-if, then deploy, into a target RG
   reports/
     summary.md                       # start here
+    summary.json                     # the same outcome, for pipelines
     portability-report.md            # what still needs your decision
     resources-and-permissions.md     # every type found, and the rights to deploy them
     diff-report.json                 # new / modified / removed, both levels
@@ -186,6 +223,8 @@ Any parameter overrides the matching config value; anything omitted keeps the fi
   runs/<timestamp>/                  # historical copy of that run's reports
   state.json                         # fingerprints, for the next run's diff
 ```
+
+`Full` mode mirrors the template: per-resource files for anything no longer present are pruned. `Delta` mode rewrites only the files whose resource changed at either level, and prunes exactly the files of resources the diff reports as removed.
 
 ---
 
@@ -198,7 +237,7 @@ The ARM export of some resource types contains live secret material — SQL admi
 Detection is two-layered and configurable:
 
 1. **Property name** — `connectionString`, `*accountKey`, `*password`, `*secret`, `sharedAccessKey`, `sasToken`…
-2. **Value shape** — the text of a storage connection string, a `Password=` in a SQL connection string, a SAS `sig=`, a PEM key, a JWT. This catches secrets under innocuous property names.
+2. **Value shape** — the text of a storage connection string, a `Password=` in a SQL connection string, a SAS `sig=`, a PEM key, a JWT, and third-party credentials that end up in app settings: Entra ID client secrets, GitHub tokens, AWS access key ids, Slack tokens, Google API keys, `sk-` style LLM API keys. This catches secrets under innocuous property names.
 
 Three cases are treated differently:
 
@@ -207,6 +246,8 @@ Three cases are treated differently:
 | A literal secret | Replaced with a `@secure()` parameter; you supply it at deploy time |
 | `[listKeys(...)]` / `[listSecrets(...)]` | **Left alone** — resolves at deploy time, carries no key material, and parameterising it would be a downgrade |
 | An output returning `listKeys(...)` | Kept but **flagged** — outputs stay readable in deployment history |
+
+**Key Vault secrets** are the reverse problem: Azure never exports their *value*, so the resource would deploy an empty secret or fail. Each one's value is wired to a new `secretvalue_*` secure parameter (`portability.parameterizeMissingSecretValues`), which the deploy helper prompts for. They are still listed as blocking items, because someone has to know the value.
 
 **Deliberately never redacted:** names that *reference* a secret rather than containing one — `secretRef` (how Container Apps point an env var at a declared secret), `secretIdentifier`, `secretUri`, `secretName` — plus `administratorLogin`/`adminUsername` (usernames), `keyData` (an SSH *public* key), thumbprints. Redacting a reference silently breaks it, which is worse than not redacting.
 
@@ -222,9 +263,11 @@ Every run answers what is new, what changed and what was deleted, at two levels.
 
 **Level 1 — per resource.** `Get-AzResource -ExpandProperties` fingerprinted and compared with the previous `state.json`. Drives `-Mode Delta`.
 
-**Level 2 — per resource inside the template.** `Get-AzResource` does not enumerate most child resources; on a real resource group it saw 21 of 56. Key Vault secrets, model deployments, ACR scope maps and DNS records were invisible to level 1. The whole-RG template is re-exported every run including Delta, so it is fingerprinted resource by resource as a second level.
+**Level 2 — per resource inside the template.** `Get-AzResource` does not enumerate most child resources; on a real resource group it saw 21 of 56. Key Vault secrets, model deployments, ACR scope maps and DNS records were invisible to level 1. The whole-RG template is re-exported every run including Delta, so it is fingerprinted resource by resource as a second level. A child-level change also marks its parent's per-resource file for rewriting in Delta mode.
 
-**Unknown — the fourth state.** A resource whose properties could not be fetched is reported as Unknown, never as unchanged or modified. Transient failures are retried with backoff; if the fetch still fails no fingerprint is recorded and the resource is exported anyway. Reporting it as unchanged would hide drift; as modified it would cry wolf on every later run.
+**Fingerprints are canonical.** Each one hashes a key-sorted form of the resource. Hashing the raw serialisation was not stable: `Get-AzResource` returns tags as a plain hashtable, .NET randomises string hashing per process, and a resource with two or more tags came out in a different key order — and so with a different fingerprint — on every run. `state.json` records the fingerprint format; a run against state written in an older format re-baselines once instead of reporting everything as modified.
+
+**Unknown — the fourth state.** A resource whose properties could not be fetched is reported as Unknown, never as unchanged or modified. Transient failures are retried with backoff; if the fetch still fails no fingerprint is recorded and the resource is refreshed anyway. Reporting it as unchanged would hide drift; as modified it would cry wolf on every later run. An Unknown makes the run exit `1`.
 
 **Not covered:** RBAC, locks and policy assignments are captured each run but are not part of either fingerprint — diff them with `git diff` if you commit the output.
 
@@ -236,13 +279,13 @@ Every run answers what is new, what changed and what was deleted, at two levels.
 azure export [rg-prod] 20260827-113957 - mode:Delta new:1 modified:2 removed:0 redacted:4
 ```
 
-`git log -p <OutputPath>/rg-prod/bicep/` then shows how the infrastructure changed over time. `-GitCommit` never pushes, and skips if `OutputPath` is not inside a repo. Because secrets are parameterised out, sanitised exports are safe to commit — **review your first export before the first push anyway.**
+`git log -p <OutputPath>/rg-prod/bicep/` then shows how the infrastructure changed over time. `-GitCommit` stages and commits **only this resource group's folder**, never pushes, and skips if `OutputPath` is not inside a repo. Because secrets are parameterised out, sanitised exports are safe to commit — **review your first export before the first push anyway.**
 
 ---
 
 ## Portability: automatic vs yours
 
-**Automatic:** subscription id → `subscription().subscriptionId`; tenant id → `subscription().tenantId`; source RG in resource ids → `resourceGroup().name`; region → a `location` parameter; read-only runtime state stripped.
+**Automatic:** subscription id → `subscription().subscriptionId`; tenant id → `subscription().tenantId`; source RG in resource ids → `resourceGroup().name`; region → a `location` parameter; read-only runtime state stripped. This covers resource properties, **parameter defaults and variables** — Azure exports a reference to anything outside the exported set as a `<type>_<name>_externalid` parameter defaulting to a literal resource id.
 
 Rewriting happens at the ARM expression level, not by text replacement: an identifier embedded in a longer string becomes a `format()` call with escaped braces. Round-trip tested against the real Bicep CLI.
 
@@ -251,22 +294,33 @@ Rewriting happens at the ARM expression level, not by text replacement: an ident
 | Item | Why it can't be automatic |
 |---|---|
 | Globally unique names | Storage, Key Vault, ACR etc. must be unique across Azure |
-| Key Vault secret values | Azure never exports them; the resource would deploy empty |
+| Key Vault secret values | Azure never exports them; now a secure parameter you must supply |
 | Tenant-scoped principal ids | An `objectId` does not exist in another tenant |
 | RBAC, locks, policy | Same reason — captured for audit, not generated as IaC |
-| External dependencies | Resource ids outside the source RG; must already exist in the target |
+| External dependencies | Resource ids outside the source RG (or in a same-named RG in another subscription); must already exist in the target |
 | Types Azure cannot export | Listed with their error; need hand-authoring |
 | SKU and zone availability | `-TargetLocation` checks type availability, not SKUs or zones |
+
+### Deploying
 
 Deploying is a two-step by design:
 
 ```powershell
-# 1. Fill in every <SET-ME> in bicep/main.parameters.sample.json, then:
+# 1. Copy the sample - the copy is git-ignored, the sample is not - and fill in
+#    every NON-secret <SET-ME>, overriding globally unique names as you go.
+#    Leave secure parameters as <SET-ME>: you will be prompted for them.
+Copy-Item <OutputPath>/<rg>/arm/main.parameters.sample.json <OutputPath>/<rg>/arm/main.parameters.json
+
+# 2. What-if into the target. Read the output. Only then drop -WhatIfOnly.
 <OutputPath>/<rg>/deploy/Deploy-Target.ps1 -ResourceGroupName rg-target -Location westeurope -WhatIfOnly
-# 2. Read the what-if output. Only then drop -WhatIfOnly.
 ```
 
-`Deploy-Target.ps1` refuses to run while any `<SET-ME>` remains, and asks for typed confirmation before a real deployment.
+`Deploy-Target.ps1`:
+
+- reads `arm/main.parameters.json` (or `bicep/main.parameters.json`) and refuses to fall back to the tracked sample;
+- refuses while any **non-secret** `<SET-ME>` remains, and **prompts** for every secure one (`Read-Host -AsSecureString`), holding the values in memory only;
+- deploys the **ARM** template by default — the exporter's exact output — and the decompiled Bicep only with `-UseBicep` (which needs the standalone `bicep` CLI on `PATH`, since that is what Az PowerShell calls);
+- never creates the target resource group in `-WhatIfOnly` mode, and asks for a typed `YES` before a real deployment.
 
 ---
 
@@ -282,7 +336,7 @@ Azure's export is faithful to what *exists*, not to what you would author. Three
 
 ## Configuration
 
-Everything lives in [`config/export.config.json`](config/export.config.json), commented inline via `_comment`-style keys.
+Everything lives in [`config/export.config.json`](config/export.config.json), commented inline via `_comment`-style keys. The config is **validated at startup**: an unknown key is warned about (a typo would otherwise silently fall back to the default), and an invalid enum value or a regular expression that does not compile aborts the run before anything touches Azure.
 
 | Key | Controls |
 |---|---|
@@ -295,7 +349,7 @@ Everything lives in [`config/export.config.json`](config/export.config.json), co
 | `secrets.failOnResidualSecret` | Whether the gate aborts or warns |
 | `secrets.keyNamePatterns` / `valuePatterns` | The two detection layers |
 | `secrets.allowKeyPatterns` | Names that must never be redacted — read the note in the file first |
-| `portability.*` | Identifier rewriting, read-only stripping, region strategy, unique-name types |
+| `portability.*` | Identifier rewriting, read-only stripping, region strategy, unique-name types, Key Vault secret parameterisation |
 | `supplemental.*` | Whether to collect RBAC / locks / policy |
 | `permissions.*` | The permissions report, and whether to rank built-in roles |
 | `validation.bicepBuild` | Recompile the generated Bicep as a check |
@@ -311,23 +365,25 @@ Copy the file and pass `-ConfigPath` for per-environment variants; `config/*.loc
 
 ```
 scripts/
-  Export-AzResourceGroupIaC.ps1   # entry point: orchestration and reporting
+  Export-AzResourceGroupIaC.ps1   # entry point: one resource group
+  Export-AzSubscriptionIaC.ps1    # entry point: many resource groups, one roll-up
   AzRgRevEng.psm1                 # every transform, and the only Azure calls
 config/
   export.config.json              # all tunables
 tests/
-  Invoke-Tests.ps1                # 136 assertions, no Azure at all
-  Invoke-EndToEndTest.ps1         # 40 assertions, full run against a mocked Azure
+  Invoke-Tests.ps1                # 195 assertions, no Azure at all
+  Invoke-EndToEndTest.ps1         # 63 assertions, five full runs against a mocked Azure
+.github/workflows/ci.yml          # both suites, on Linux and Windows
 ```
 
 The transform logic is deliberately separated from the Azure calls so it can be tested without a subscription. Neither suite needs Pester; both exit non-zero on failure.
 
 ```powershell
-./tests/Invoke-Tests.ps1           # ~2s
-./tests/Invoke-EndToEndTest.ps1    # ~45s, needs the Bicep CLI
+./tests/Invoke-Tests.ps1           # a few seconds
+./tests/Invoke-EndToEndTest.ps1    # ~45s with the standalone Bicep CLI
 ```
 
-`Invoke-EndToEndTest.ps1` runs the real exporter against a fake resource group with the Az cmdlets replaced by functions in the global scope — built out of the awkward cases on purpose: a type Azure refuses to export, a `listKeys()` expression that must survive, a cross-resource-group reference, a type missing from the target region. It asserts no plaintext secret reaches the output.
+`Invoke-EndToEndTest.ps1` runs the real exporter against a fake resource group with the Az cmdlets replaced by functions in the global scope — built out of the awkward cases on purpose: a type Azure refuses to export, a `listKeys()` expression that must survive, a cross-resource-group reference, an `_externalid` parameter, a type missing from the target region. It asserts no plaintext secret reaches the output, counts the export calls (one, when everything is exportable), checks an idle Delta run rewrites nothing, drives the generated deploy helper against a mocked deployment, and runs the subscription wrapper.
 
 Run both after touching any pattern in the config or any function in the module.
 
@@ -338,23 +394,32 @@ Run both after touching any pattern in the config or any function in the module.
 | Symptom | Cause / fix |
 |---|---|
 | `Connect-AzAccount: command not found` | It ran in bash. It is a PowerShell cmdlet |
-| `Prerequisite check failed` | Not signed in, Az modules missing, or `az bicep install` not done. Each item is listed |
+| `Invalid configuration in …` | A config value is not one of the allowed values, or a pattern is not a valid .NET regex. Each problem is listed |
+| `Unknown config key '…' is ignored` | Usually a typo — the default is being used instead |
+| `Prerequisite check failed` | Not signed in, Az modules missing, or no Bicep CLI. Each item is listed |
 | `The current Azure context has no subscription id` | Fails fast by design — re-run `Connect-AzAccount` or pass `-SubscriptionId` |
 | Inventory succeeds but every export fails | Almost certainly the export-template permission. See [Azure roles](#azure-roles-the-identity-needs) |
+| `whole-RG export failed … probing` | A type Azure cannot export. Expected; the run isolates it and carries on. It is listed in the portability report |
 | Run aborted on the secret gate (exit 2) | Working as designed — see [Secret handling](#secret-handling) |
 | Thousands of resources dropped from a small RG | Expected — Log Analytics contributes ~678 built-in table schemas per workspace. Every drop is itemised |
 | `Error max-resources: limited to 800` | `excludeChildTypes` does not cover a noisy child type in this RG |
 | `BCP079` / `BCP080` | The normalisations that fix these are disabled, or a type needs a new `redundantInlineChildren` rule |
-| `main.bicep` doesn't compile | Errors are in `summary.md`; the ARM is still valid — decompilation is the best-effort half |
+| `main.bicep` doesn't compile | Errors are in `summary.md`; the ARM is still valid, and it is what the deploy helper deploys by default |
 | A config property was wrongly redacted | Add it to `secrets.allowKeyPatterns` and add a regression case to the unit suite |
+| `fingerprint format … re-baselines` | `state.json` predates canonical fingerprints. One-off; drift is reported again from the next run |
 | **Every** resource shows as modified | Not organic change — the previous run stored degraded fingerprints. Check it for Unknown resources |
-| Delta mode exports everything | No `state.json` yet, so the run is a baseline |
+| Delta mode rewrites everything | No `state.json` yet, so the run is a baseline |
 | A resource shows as modified every run | Its fingerprint includes a property Azure updates itself. Narrow with `resourceFilters`, or accept it |
+| `Deploy-Target.ps1`: `No parameter file` | Copy `arm/main.parameters.sample.json` to `arm/main.parameters.json` first — see [Deploying](#deploying) |
 
 ---
 
 ## Status
 
-Verified end to end against a live resource group: exports cleanly, `main.bicep` compiles, secret gate passes, and drift detection was confirmed against a real mutation (a tag added then removed — detected both ways, silent when idle).
+The original single-resource-group exporter was verified end to end against a live resource group: exports cleanly, `main.bicep` compiles, secret gate passes, and drift detection was confirmed against a real mutation (a tag added then removed — detected both ways, silent when idle).
 
-**Not yet verified: that the generated templates actually deploy.** `main.bicep` compiling is a weaker claim than a successful `-WhatIfOnly` against a real target. Key Vault secrets with no exported value are the most likely thing to trip a first deployment.
+**The changes in this version are verified against the mocked end-to-end suite and the real Bicep CLI, not yet against a live subscription.** That includes the export-once-and-split flow, the probe fallback, the subscription wrapper and the new deploy helper. The first live run is the thing to watch — in particular, how faithfully the split per-resource files decompile on a large, heavily cross-referenced resource group.
+
+**Not yet verified at all: that the generated templates actually deploy.** `main.bicep` compiling is a weaker claim than a successful `-WhatIfOnly` against a real target.
+
+What is planned next, and why multi-cloud lives in separate tools, is in [ROADMAP.md](ROADMAP.md).
