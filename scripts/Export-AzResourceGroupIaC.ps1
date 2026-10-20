@@ -649,7 +649,8 @@ if ($wantRbac -or $wantLocks -or $wantPolicy) {
 $regionSupport = $null
 if ($TargetLocation) {
     Write-RevEngLog "Checking resource type availability in '$TargetLocation'" -Level Step
-    $types = @($targetIds | ForEach-Object { $inventory[$_]['type'] })
+    # Every type, not just this run's changes: a move takes the whole group.
+    $types = @($inventory.Values | ForEach-Object { $_['type'] })
     $regionSupport = Test-RevEngRegionSupport -ResourceType $types -TargetLocation $TargetLocation
     $unsupported = @($regionSupport | Where-Object { $_.Supported -eq 'NO' })
     if ($unsupported.Count -gt 0) {
