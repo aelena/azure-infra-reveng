@@ -75,7 +75,14 @@ function global:Set-AzContext { param([Parameter(ValueFromRemainingArguments)]$R
 
 function global:Get-AzResourceGroup {
     param([string]$Name, [Parameter(ValueFromRemainingArguments)]$Rest)
-    [pscustomobject]@{ ResourceGroupName = $Name; Location = 'eastus' }
+    if ($Name) { return [pscustomobject]@{ ResourceGroupName = $Name; Location = 'eastus'; ManagedBy = $null } }
+    # The listing the subscription wrapper selects from.
+    @(
+        [pscustomobject]@{ ResourceGroupName = $global:RG;                 Location = 'eastus'; ManagedBy = $null }
+        [pscustomobject]@{ ResourceGroupName = 'MC_rg-aks_aks1_eastus';    Location = 'eastus'; ManagedBy = '/subscriptions/x/resourceGroups/rg-aks/providers/Microsoft.ContainerService/managedClusters/aks1' }
+        [pscustomobject]@{ ResourceGroupName = 'NetworkWatcherRG';         Location = 'eastus'; ManagedBy = $null }
+        [pscustomobject]@{ ResourceGroupName = 'rg-other-team';            Location = 'eastus'; ManagedBy = $null }
+    )
 }
 
 function global:Get-AzResource {
@@ -371,6 +378,21 @@ try {
     $diff3 = Get-Content -LiteralPath (Join-Path $reports 'diff-report.json') -Raw | ConvertFrom-Json
     Assert-That (@($diff3.modified).Count -eq 0 -and @($diff3.new).Count -eq 0) 'and reports no drift'
     Assert-That ($run4Exit -eq 0)                                         'so -FailOnDrift exits 0'
+
+    # -----------------------------------------------------------------------
+    Write-Host "`n=== RUN 5: subscription wrapper ===" -ForegroundColor Magenta
+    $wrapper = Join-Path $repoRoot 'scripts/Export-AzSubscriptionIaC.ps1'
+    & $wrapper -ResourceGroupName 'rg-e2e-*', 'MC_*', 'NetworkWatcherRG' -OutputPath $outRoot -Mode Delta -SkipBicep | Out-Null
+    $wrapExit = $LASTEXITCODE
+
+    Write-Host "`nRun 5 assertions" -ForegroundColor Cyan
+    $roll = Get-Content -LiteralPath (Join-Path $outRoot 'subscription-summary.json') -Raw | ConvertFrom-Json
+    Assert-That (@($roll.resourceGroups).Count -eq 1 -and $roll.resourceGroups[0].name -eq $global:RG) 'the wrapper exports only the matching, unmanaged resource group'
+    Assert-That (@($roll.skipped | Where-Object { $_.name -like 'MC_*' -and $_.reason -match 'managed by' }).Count -eq 1) 'an AKS-managed resource group is skipped, with the reason'
+    Assert-That (@($roll.skipped | Where-Object { $_.name -eq 'NetworkWatcherRG' }).Count -eq 1) 'an auto-created resource group is skipped by default'
+    Assert-That (-not (@($roll.skipped.name) -contains 'rg-other-team'))     'a resource group that matched no pattern is neither exported nor listed'
+    Assert-That ($wrapExit -eq 0 -and $roll.exitCode -eq 0 -and $roll.resourceGroups[0].counts.resourcesInScope -eq 2) 'the roll-up carries each resource group''s outcome and counts'
+    Assert-That (Test-Path (Join-Path $outRoot 'subscription-summary.md')) 'a markdown roll-up is written too'
 }
 finally {
     if ($KeepOutput) {
