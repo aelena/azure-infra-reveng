@@ -223,6 +223,7 @@ function global:Export-AzResourceGroup {
 try {
     Write-Host "`n=== RUN 1: full baseline ===" -ForegroundColor Magenta
     & $exporter -ResourceGroupName $global:RG -OutputPath $outRoot -TargetLocation 'westeurope' | Out-Null
+    $run1Exit = $LASTEXITCODE
 
     $rgOut    = Join-Path $outRoot $global:RG
     $reports  = Join-Path $rgOut 'reports'
@@ -241,6 +242,11 @@ try {
     Assert-That (Test-Path (Join-Path $bicepRes 'sites_app-e2e.bicep'))              'the web app got its own Bicep template'
     Assert-That (-not (Test-Path (Join-Path $rgOut '.work')))                        'the private working folder was cleaned up'
     Assert-That (-not (Test-Path (Join-Path $rgOut 'raw-unsanitised')))              'no raw unsanitised export was left behind'
+    Assert-That ((Get-Content (Join-Path $rgOut '.gitignore') -Raw) -match '\.work/') 'the output folder carries its own .gitignore for the unredacted paths'
+    $summaryJson = Get-Content -LiteralPath (Join-Path $reports 'summary.json') -Raw | ConvertFrom-Json
+    Assert-That ($run1Exit -eq 1 -and $summaryJson.exitCode -eq 1)                   'an unexportable resource completes with issues (exit 1)'
+    Assert-That (@(@($summaryJson.issues) -match 'could not export').Count -eq 1)                  'and summary.json says why'
+    Assert-That ($summaryJson.counts.secretsRedacted -ge 2)                          'summary.json carries the run counts'
 
     # The whole point: no plaintext secret anywhere in the output tree.
     $leaked = [System.Collections.Generic.List[string]]::new()
@@ -331,11 +337,13 @@ try {
     Write-Host "`n=== RUN 2: delta, with a change and a deletion ===" -ForegroundColor Magenta
     $global:MockSalt = 'v2-changed'
     $global:MockResources = @($global:MockResources | Where-Object { $_.Name -ne 'sql-e2e' })
-    & $exporter -ResourceGroupName $global:RG -OutputPath $outRoot -Mode Delta | Out-Null
+    & $exporter -ResourceGroupName $global:RG -OutputPath $outRoot -Mode Delta -FailOnDrift | Out-Null
+    $run2Exit = $LASTEXITCODE
 
     Write-Host "`nRun 2 assertions" -ForegroundColor Cyan
     $diff = Get-Content -LiteralPath (Join-Path $reports 'diff-report.json') -Raw | ConvertFrom-Json
     Assert-That ($diff.mode -eq 'Delta')                                  'the run recorded Delta mode'
+    Assert-That ($run2Exit -eq 3)                                         'with -FailOnDrift, drift exits 3'
     Assert-That (@($diff.removed).Count -eq 1)                            'the deleted SQL server is reported as removed'
     Assert-That (@($diff.removed)[0].name -eq 'sql-e2e')                  'and it is the right resource'
     Assert-That (@($diff.modified).Count -eq 3)                           'the changed resources are reported as modified'
@@ -352,7 +360,8 @@ try {
     & $exporter -ResourceGroupName $global:RG -OutputPath $outRoot -Mode Delta | Out-Null
     $global:ExportCalls = 0
     $stamps = @{}; foreach ($f in (Get-ChildItem $armRes -File)) { $stamps[$f.Name] = $f.LastWriteTimeUtc }
-    & $exporter -ResourceGroupName $global:RG -OutputPath $outRoot -Mode Delta | Out-Null
+    & $exporter -ResourceGroupName $global:RG -OutputPath $outRoot -Mode Delta -FailOnDrift | Out-Null
+    $run4Exit = $LASTEXITCODE
 
     Write-Host "`nRun 3+4 assertions" -ForegroundColor Cyan
     Assert-That ($global:ExportCalls -eq 1) "an exportable resource group costs exactly one export call ($global:ExportCalls)"
@@ -361,6 +370,7 @@ try {
     Assert-That (@(Get-ChildItem $armRes -File).Count -eq 2)              'the per-resource library still holds both remaining resources'
     $diff3 = Get-Content -LiteralPath (Join-Path $reports 'diff-report.json') -Raw | ConvertFrom-Json
     Assert-That (@($diff3.modified).Count -eq 0 -and @($diff3.new).Count -eq 0) 'and reports no drift'
+    Assert-That ($run4Exit -eq 0)                                         'so -FailOnDrift exits 0'
 }
 finally {
     if ($KeepOutput) {

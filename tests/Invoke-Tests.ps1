@@ -744,6 +744,33 @@ Remove-Item function:global:Get-AzProviderOperation, function:global:Get-AzRoleD
 Remove-Variable -Name ProviderCalls -Scope Global -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------------------
+Test-Group 'Git commit is scoped to the resource group folder'
+if (Get-Command git -ErrorAction SilentlyContinue) {
+    $repo = Join-Path ([IO.Path]::GetTempPath()) ('azinfrareveng-git-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path (Join-Path $repo 'rg-a'), (Join-Path $repo 'rg-b') -Force | Out-Null
+    try {
+        Push-Location $repo
+        & git init -q 2>&1 | Out-Null
+        & git config user.email 'test@example.com'; & git config user.name 'test'; & git config commit.gpgsign false
+        Set-Content 'rg-a/main.json' '{}'; Set-Content 'rg-b/main.json' '{}'; Set-Content 'notes.txt' 'unrelated work'
+        Pop-Location
+
+        $c = Invoke-RevEngGitCommit -Path (Join-Path $repo 'rg-a') -Message 'export rg-a'
+        Assert-True $c.Committed 'the resource group folder is committed'
+        $committed = @(& git -C $repo show --name-only --format= HEAD)
+        Assert-Equal 'rg-a/main.json' ($committed -join ',') 'and nothing outside it'
+        Assert-True ((& git -C $repo status --porcelain | Out-String) -match 'notes\.txt') 'unrelated changes are left uncommitted'
+
+        $again = Invoke-RevEngGitCommit -Path (Join-Path $repo 'rg-a') -Message 'again'
+        Assert-False $again.Committed 'a second run with no changes in the folder commits nothing, despite changes elsewhere'
+    } finally {
+        Remove-Item -LiteralPath $repo -Recurse -Force -ErrorAction SilentlyContinue
+    }
+} else {
+    Write-Host '  SKIP  git not on PATH' -ForegroundColor DarkYellow
+}
+
+# ---------------------------------------------------------------------------
 Test-Group 'Config overrides'
 $c = Get-RevEngExportConfig -Path (Join-Path $PSScriptRoot '../config/export.config.json') -Overrides @{
     'mode'           = 'Delta'

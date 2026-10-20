@@ -69,7 +69,12 @@
     Emit ARM only. Useful when the Bicep CLI is unavailable.
 
 .PARAMETER GitCommit
-    Commit the run inside the repo that contains OutputPath. Never pushes.
+    Commit the run inside the repo that contains OutputPath. Only this resource
+    group's folder is staged and committed. Never pushes.
+
+.PARAMETER FailOnDrift
+    Exit with code 3 when anything was added, changed or removed since the
+    previous run, at either level. For scheduled drift checks in CI.
 
 .EXAMPLE
     ./Export-AzResourceGroupIaC.ps1 -ResourceGroupName rg-example-prod
@@ -100,7 +105,8 @@ param(
     [switch]$SkipPolicies,
     [switch]$SkipBicep,
     [switch]$SkipPermissionReport,
-    [switch]$GitCommit
+    [switch]$GitCommit,
+    [switch]$FailOnDrift
 )
 
 $ErrorActionPreference = 'Stop'
@@ -222,6 +228,21 @@ foreach ($p in @($paths.Root, $paths.Work, $paths.Arm, $paths.ArmResources, $pat
 }
 if ($emitBicep) {
     foreach ($p in @($paths.Bicep, $paths.BicepResources)) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
+}
+
+# The output folder protects itself: whatever repo it is committed to, and
+# whatever that repo's own .gitignore says, the unredacted export stays out.
+$selfIgnore = Join-Path $paths.Root '.gitignore'
+if (-not (Test-Path -LiteralPath $selfIgnore)) {
+    Write-RevEngTextFile -Path $selfIgnore -Content (@(
+        '# Written by Export-AzResourceGroupIaC.ps1. These can contain live secrets.'
+        '.work/'
+        'raw-unsanitised/'
+        '*.parameters.json'
+        '!*.parameters.sample.json'
+        '*.bicepparam'
+        '!*.sample.bicepparam'
+    ) -join [Environment]::NewLine)
 }
 
 # --- 1. Inventory + fingerprint ------------------------------------------
@@ -865,6 +886,51 @@ if ($bicepWarnings.Count -gt 0) {
 }
 Write-RevEngTextFile -Content ($sm -join [Environment]::NewLine) -Path (Join-Path $paths.Reports 'summary.md')
 
+# --- summary.json: the same outcome, for pipelines ------------------------
+# Deliberate exit code, so a scheduled run can be gated on it. Without this the
+# script would inherit whatever the last `az` invocation happened to return.
+$issueList = [System.Collections.Generic.List[string]]::new()
+if ($exportFailures.Count -gt 0)                   { $issueList.Add("$($exportFailures.Count) resource(s) Azure could not export") }
+if ($bicepFailures.Count -gt 0)                    { $issueList.Add("$($bicepFailures.Count) Bicep decompile failure(s)") }
+if ($buildResult -and -not $buildResult.Success)   { $issueList.Add('main.bicep does not compile') }
+if ($residualLeaks.Count -gt 0)                    { $issueList.Add("$($residualLeaks.Count) secret-shaped value(s) allowed through") }
+if ($diff.Unknown.Count -gt 0)                     { $issueList.Add("$($diff.Unknown.Count) resource(s) could not be fingerprinted") }
+
+$childChanges = if ($childDiff) { $childDiff.New.Count + $childDiff.Modified.Count + $childDiff.Removed.Count } else { 0 }
+$driftDetected = (-not $isBaseline) -and (($diff.New.Count + $diff.Modified.Count + $diff.Removed.Count + $childChanges) -gt 0)
+# 3 outranks 1 because -FailOnDrift is an explicit request; issues are in the JSON either way.
+$exitCode = if ($FailOnDrift -and $driftDetected) { 3 } elseif ($issueList.Count -gt 0) { 1 } else { 0 }
+
+Write-RevEngJsonFile -Path (Join-Path $paths.Reports 'summary.json') -InputObject (New-RevEngOrderedMap @{
+    run                = $runStamp
+    resourceGroupName  = $ResourceGroupName
+    subscriptionId     = $sourceSubscriptionId
+    tenantId           = $sourceTenantId
+    location           = $primaryLocation
+    mode               = $effectiveMode
+    baseline           = $isBaseline
+    rebaselined        = $rebaselined
+    driftDetected      = $driftDetected
+    exitCode           = $exitCode
+    issues             = @($issueList)
+    counts             = New-RevEngOrderedMap @{
+        resourcesInScope      = $inventory.Count
+        templateResources     = $templateMap.Count
+        filesWritten          = $resourceFiles.Count
+        new                   = $diff.New.Count
+        modified              = $diff.Modified.Count
+        removed               = $diff.Removed.Count
+        unknown               = $diff.Unknown.Count
+        templateLevelChanges  = $childChanges
+        secretsRedacted       = $allRedactions.Count
+        residualSecrets       = $residualLeaks.Count
+        exportFailures        = $exportFailures.Count
+        bicepFailures         = $bicepFailures.Count
+        blockingItems         = @($allFindings | Where-Object { $_.Severity -eq 'Action required' }).Count
+    }
+    mainBicepCompiles  = $(if ($buildResult) { [bool]$buildResult.Success } else { $null })
+}) | Out-Null
+
 # =========================================================================
 # 8b. Resource types and permissions report
 # =========================================================================
@@ -1066,7 +1132,7 @@ if ($autoCommit) {
     Write-RevEngLog 'Committing run to git' -Level Step
     $msg = "azure export [{0}] {1} - mode:{2} new:{3} modified:{4} removed:{5} redacted:{6}" -f `
         $ResourceGroupName, $runStamp, $effectiveMode, $diff.New.Count, $diff.Modified.Count, $diff.Removed.Count, $allRedactions.Count
-    $commit = Invoke-RevEngGitCommit -Path $outputRoot -Message $msg
+    $commit = Invoke-RevEngGitCommit -Path $paths.Root -Message $msg
     if ($commit.Committed) {
         Write-RevEngLog $commit.Reason -Level Ok
         Write-RevEngLog 'Not pushed - run git push when you are ready.'
@@ -1077,9 +1143,9 @@ if ($autoCommit) {
 
 # Deliberate exit code, so a scheduled run can be gated on it. Without this the
 # script would inherit whatever the last `az` invocation happened to return.
-$issues = ($exportFailures.Count -gt 0) -or ($buildResult -and -not $buildResult.Success) -or ($residualLeaks.Count -gt 0)
-if ($issues) {
-    Write-RevEngLog 'Completed with issues - see reports/summary.md.' -Level Warn
-    exit 1
+if ($exitCode -eq 3) {
+    Write-RevEngLog 'Drift detected (-FailOnDrift) - see reports/diff-report.json.' -Level Warn
+} elseif ($exitCode -eq 1) {
+    Write-RevEngLog ('Completed with issues: {0}. See reports/summary.md.' -f ($issueList -join '; ')) -Level Warn
 }
-exit 0
+exit $exitCode

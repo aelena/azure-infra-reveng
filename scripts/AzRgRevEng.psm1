@@ -2147,11 +2147,13 @@ function Invoke-RevEngGitCommit {
         if ($LASTEXITCODE -ne 0 -or $inside -ne 'true') {
             return [pscustomobject]@{ Committed = $false; Reason = "'$Path' is not inside a git repository." }
         }
-        & git add -A 2>&1 | Out-Null
-        if ([string]::IsNullOrWhiteSpace((& git status --porcelain | Out-String))) {
+        # Scoped to $Path: the audit repo may hold other resource groups, or
+        # unrelated work in progress, and none of that belongs in this commit.
+        & git add -A -- . 2>&1 | Out-Null
+        if ([string]::IsNullOrWhiteSpace((& git status --porcelain -- . | Out-String))) {
             return [pscustomobject]@{ Committed = $false; Reason = 'No file changes to commit.' }
         }
-        & git commit -m $Message 2>&1 | Out-Null
+        & git commit -m $Message -- . 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) {
             return [pscustomobject]@{ Committed = $false; Reason = 'git commit failed - check hooks and user.name/user.email.' }
         }
