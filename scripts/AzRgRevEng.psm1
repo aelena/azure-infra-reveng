@@ -668,6 +668,257 @@ function Remove-RevEngRedundantInlineChild {
 }
 
 # ---------------------------------------------------------------------------
+# Splitting and merging templates
+#
+# The whole resource group is exported ONCE and every transform runs once on
+# that template; the per-resource files are then cut out of it locally. That
+# replaces one Export-AzResourceGroup call per resource (each a slow,
+# throttle-prone ARM operation) and the double processing - and deduplication
+# of findings - that came with it. It also groups child resources with their
+# parent, so a Key Vault's file carries its secrets and access policies.
+# ---------------------------------------------------------------------------
+
+function Get-RevEngExpressionToken {
+    <#
+    .SYNOPSIS
+        Reduces a resource name, or a resourceId(...) reference, to a list of
+        comparable tokens.
+    .DESCRIPTION
+        "[concat(parameters('vaults_kv1_name'), '/alpha')]" and
+        "[resourceId('Microsoft.KeyVault/vaults/secrets', parameters('vaults_kv1_name'), 'alpha')]"
+        both become p:vaults_kv1_name, l:alpha - which is how a dependsOn entry
+        is matched to the resource it names. With -ExtractType the first literal
+        shaped like a resource type is taken out as .Type rather than tokenised.
+    .OUTPUTS
+        @{ Type = <string or $null>; Tokens = @('p:...', 'l:...') }
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Value,
+        [switch]$ExtractType
+    )
+
+    $tokens = [System.Collections.Generic.List[string]]::new()
+    $type = $null
+    if ([string]::IsNullOrEmpty($Value)) { return @{ Type = $null; Tokens = @() } }
+
+    if (-not (Test-RevEngArmExpression -Value $Value)) {
+        foreach ($piece in ($Value -split '/')) { if ($piece) { $tokens.Add('l:' + $piece.ToLowerInvariant()) } }
+        return @{ Type = $null; Tokens = $tokens.ToArray() }
+    }
+
+    $segments = @(Split-RevEngArmExpressionBody -Body $Value.Substring(1, $Value.Length - 2))
+    for ($i = 0; $i -lt $segments.Count; $i++) {
+        $seg = $segments[$i]
+        if (-not $seg.IsLiteral) { continue }
+        $before = if ($i -gt 0 -and -not $segments[$i - 1].IsLiteral) { $segments[$i - 1].Text } else { '' }
+        if ($before -match '(?i)\b(parameters|variables)\(\s*$') {
+            $tokens.Add($Matches[1].Substring(0, 1).ToLowerInvariant() + ':' + $seg.Text.ToLowerInvariant())
+            continue
+        }
+        if ($ExtractType -and -not $type -and $seg.Text -match '^[A-Za-z][\w-]*(\.[\w-]+)+(/[\w.-]+)+$') {
+            $type = $seg.Text
+            continue
+        }
+        foreach ($piece in ($seg.Text -split '/')) { if ($piece) { $tokens.Add('l:' + $piece.ToLowerInvariant()) } }
+    }
+    return @{ Type = $type; Tokens = $tokens.ToArray() }
+}
+
+function Merge-RevEngTemplate {
+    <#
+    .SYNOPSIS
+        Unions several exported templates into one: parameters, variables and
+        outputs by name (first wins), resources by type and name.
+    .DESCRIPTION
+        Used when the whole-RG export fails outright: the resources Azure CAN
+        export are exported one by one and merged, so there is still a single
+        template to transform and split.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyCollection()][array]$Template)
+
+    $merged = New-RevEngOrderedMap
+    $merged['$schema'] = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#'
+    $merged['contentVersion'] = '1.0.0.0'
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $resources = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($t in $Template) {
+        if (-not (Test-RevEngIsDictionary $t)) { continue }
+        foreach ($section in @('parameters', 'variables', 'outputs')) {
+            if (-not (Test-RevEngHasKey $t $section)) { continue }
+            if (-not $merged.Contains($section)) { $merged[$section] = New-RevEngOrderedMap }
+            foreach ($k in @($t[$section].Keys)) {
+                if (-not $merged[$section].Contains($k)) { $merged[$section][$k] = $t[$section][$k] }
+            }
+        }
+        foreach ($res in @($t['resources'])) {
+            if (-not (Test-RevEngIsDictionary $res)) { continue }
+            if ($seen.Add(('{0}|{1}' -f $res['type'], $res['name']))) { $resources.Add($res) }
+        }
+    }
+    $merged['resources'] = $resources.ToArray()
+    return $merged
+}
+
+function Split-RevEngTemplate {
+    <#
+    .SYNOPSIS
+        Cuts a whole-RG template into one self-contained template per top-level
+        resource, each carrying its child resources and exactly the parameters
+        and variables it references.
+    .DESCRIPTION
+        A resource whose type has a single '/' is top level. Every other
+        resource joins the top-level resource whose type prefixes its own and
+        whose name tokens prefix its own (so 'vaults/secrets' named
+        concat(parameters('kv'), '/x') joins the vault named parameters('kv')).
+        A child whose parent is not in the template gets a file of its own.
+
+        dependsOn entries that point outside the group are dropped from that
+        group's copy - in a standalone file they would be dangling references
+        (BCP062 once decompiled). The input template is not modified.
+    .OUTPUTS
+        Array of @{ Type; Name; Template; Members; DependenciesDropped }, where
+        Name is the real resource name (parameter defaults resolved) and
+        Members are the "<type>|<name>" keys used by the template-level map.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Template)
+
+    $parameters = if (Test-RevEngHasKey $Template 'parameters') { $Template['parameters'] } else { New-RevEngOrderedMap }
+    $variables = if (Test-RevEngHasKey $Template 'variables') { $Template['variables'] } else { New-RevEngOrderedMap }
+
+    $entries = [System.Collections.Generic.List[object]]::new()
+    foreach ($res in @($Template['resources'])) {
+        if (-not (Test-RevEngIsDictionary $res)) { continue }
+        $type = if ($res.Contains('type')) { [string]$res['type'] } else { 'unknown' }
+        $name = if ($res.Contains('name')) { [string]$res['name'] } else { '' }
+        $entries.Add([pscustomobject]@{
+            Resource = $res
+            Type     = $type
+            Name     = $name
+            Tokens   = @((Get-RevEngExpressionToken -Value $name).Tokens)
+            TopLevel = (@($type -split '/').Count -eq 2)
+            Group    = $null
+        })
+    }
+
+    $groups = [System.Collections.Generic.List[object]]::new()
+    foreach ($e in ($entries | Where-Object TopLevel)) {
+        $e.Group = [pscustomobject]@{ Owner = $e; Entries = [System.Collections.Generic.List[object]]::new() }
+        $e.Group.Entries.Add($e)
+        $groups.Add($e.Group)
+    }
+
+    foreach ($e in ($entries | Where-Object { -not $_.TopLevel })) {
+        $best = $null
+        foreach ($g in $groups) {
+            $owner = $g.Owner
+            if (-not $e.Type.StartsWith($owner.Type + '/', [StringComparison]::OrdinalIgnoreCase)) { continue }
+            if ($owner.Tokens.Count -eq 0 -or $owner.Tokens.Count -ge $e.Tokens.Count) { continue }
+            $prefix = $true
+            for ($i = 0; $i -lt $owner.Tokens.Count; $i++) {
+                if ($owner.Tokens[$i] -ne $e.Tokens[$i]) { $prefix = $false; break }
+            }
+            if ($prefix -and (-not $best -or $owner.Type.Length -gt $best.Owner.Type.Length)) { $best = $g }
+        }
+        if (-not $best) {
+            $best = [pscustomobject]@{ Owner = $e; Entries = [System.Collections.Generic.List[object]]::new() }
+            $groups.Add($best)
+        }
+        $e.Group = $best
+        $best.Entries.Add($e)
+    }
+
+    $paramRx = [regex]"(?i)\bparameters\(\s*'((?:[^']|'')+)'\s*\)"
+    $varRx = [regex]"(?i)\bvariables\(\s*'((?:[^']|'')+)'\s*\)"
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($g in $groups) {
+        $members = @($g.Entries)
+        $memberRefs = @($members | ForEach-Object { [pscustomobject]@{ Type = $_.Type; Key = ($_.Tokens -join '|') } })
+
+        $dropped = 0
+        $copies = [System.Collections.Generic.List[object]]::new()
+        foreach ($m in $members) {
+            # Shallow copy: only dependsOn is replaced, so the input stays intact.
+            $copy = New-RevEngOrderedMap
+            foreach ($k in @($m.Resource.Keys)) { $copy[$k] = $m.Resource[$k] }
+            if ($copy.Contains('dependsOn')) {
+                $kept = [System.Collections.Generic.List[object]]::new()
+                foreach ($dep in @($copy['dependsOn'])) {
+                    $ref = Get-RevEngExpressionToken -Value ([string]$dep) -ExtractType
+                    $inGroup = (-not $ref.Type) -or @($memberRefs | Where-Object {
+                        $_.Type -ieq $ref.Type -and $_.Key -eq ($ref.Tokens -join '|')
+                    }).Count -gt 0
+                    if ($inGroup) { $kept.Add($dep) } else { $dropped++ }
+                }
+                if ($kept.Count -gt 0) { $copy['dependsOn'] = $kept.ToArray() } else { $copy.Remove('dependsOn') }
+            }
+            $copies.Add($copy)
+        }
+
+        # Parameters and variables referenced by the group, followed transitively
+        # through parameter defaults and variable values.
+        $needParams = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $needVars = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $pending = [System.Collections.Generic.Queue[string]]::new()
+        $pending.Enqueue((ConvertTo-Json -InputObject $copies.ToArray() -Depth 64 -Compress))
+        while ($pending.Count -gt 0) {
+            $text = $pending.Dequeue()
+            foreach ($m in $paramRx.Matches($text)) {
+                $p = $m.Groups[1].Value -replace "''", "'"
+                if ($parameters.Contains($p) -and $needParams.Add($p)) {
+                    $pending.Enqueue((ConvertTo-Json -InputObject $parameters[$p] -Depth 64 -Compress))
+                }
+            }
+            foreach ($m in $varRx.Matches($text)) {
+                $v = $m.Groups[1].Value -replace "''", "'"
+                if ($variables.Contains($v) -and $needVars.Add($v)) {
+                    $pending.Enqueue((ConvertTo-Json -InputObject $variables[$v] -Depth 64 -Compress))
+                }
+            }
+        }
+
+        $part = New-RevEngOrderedMap
+        foreach ($k in @('$schema', 'contentVersion')) { if ($Template.Contains($k)) { $part[$k] = $Template[$k] } }
+        if ($needParams.Count -gt 0) {
+            $part['parameters'] = New-RevEngOrderedMap
+            foreach ($k in @($parameters.Keys)) { if ($needParams.Contains($k)) { $part['parameters'][$k] = $parameters[$k] } }
+        }
+        if ($needVars.Count -gt 0) {
+            $part['variables'] = New-RevEngOrderedMap
+            foreach ($k in @($variables.Keys)) { if ($needVars.Contains($k)) { $part['variables'][$k] = $variables[$k] } }
+        }
+        $part['resources'] = $copies.ToArray()
+
+        # The real name: a lone parameter reference resolves to its default.
+        $owner = $g.Owner
+        $display = $null
+        if ($owner.Tokens.Count -eq 1 -and $owner.Tokens[0] -like 'p:*') {
+            $pn = $owner.Tokens[0].Substring(2)
+            foreach ($k in @($parameters.Keys)) {
+                if ($k -ieq $pn -and (Test-RevEngHasKey $parameters[$k] 'defaultValue') -and $parameters[$k]['defaultValue'] -is [string]) {
+                    $display = [string]$parameters[$k]['defaultValue']
+                }
+            }
+        }
+        if (-not $display -and -not (Test-RevEngArmExpression -Value $owner.Name)) { $display = $owner.Name }
+        if (-not $display) { $display = Get-RevEngResourceLabel -Name $owner.Name -Type $owner.Type }
+
+        $results.Add([pscustomobject]@{
+            Type                = $owner.Type
+            Name                = $display
+            Template            = $part
+            Members             = @($members | ForEach-Object { '{0}|{1}' -f $_.Type, $_.Name })
+            DependenciesDropped = $dropped
+        })
+    }
+    return $results.ToArray()
+}
+
+# ---------------------------------------------------------------------------
 # Secret detection / redaction
 # ---------------------------------------------------------------------------
 
@@ -1938,6 +2189,9 @@ Export-ModuleMember -Function @(
     'ConvertTo-RevEngArmLiteral'
     'ConvertTo-RevEngArmFragment'
     'Convert-RevEngPortableString'
+    'Get-RevEngExpressionToken'
+    'Merge-RevEngTemplate'
+    'Split-RevEngTemplate'
     'Update-RevEngDependsOn'
     'Remove-RevEngNoiseResource'
     'Remove-RevEngRedundantInlineChild'

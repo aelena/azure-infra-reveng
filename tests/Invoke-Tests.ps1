@@ -208,6 +208,81 @@ Assert-True  ($pe['subnet'].Contains('id')) 'a reference object with no sibling 
 Assert-True  ($pe['settings'][0].Contains('id')) 'a non-resource-id value beside a name is left alone'
 
 # ---------------------------------------------------------------------------
+Test-Group 'Splitting the whole-RG template into per-resource files'
+
+$t = Get-RevEngExpressionToken -Value "[concat(parameters('vaults_kv1_name'), '/alpha')]"
+Assert-Equal 'p:vaults_kv1_name|l:alpha' ($t.Tokens -join '|') 'a child name reduces to its parameter and literal tokens'
+$t = Get-RevEngExpressionToken -Value "[resourceId('Microsoft.KeyVault/vaults/secrets', parameters('vaults_kv1_name'), 'alpha')]" -ExtractType
+Assert-Equal 'Microsoft.KeyVault/vaults/secrets' $t.Type 'the resource type is taken out of a resourceId() reference'
+Assert-Equal 'p:vaults_kv1_name|l:alpha' ($t.Tokens -join '|') 'and the name arguments tokenise exactly like the resource name'
+$t = Get-RevEngExpressionToken -Value 'kv1/alpha'
+Assert-Equal 'l:kv1|l:alpha' ($t.Tokens -join '|') 'a literal name tokenises on its slashes'
+
+$whole = @'
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "vaults_kv1_name": { "type": "String", "defaultValue": "kv-one" },
+    "serverfarms_plan1_name": { "type": "String", "defaultValue": "plan-one" },
+    "sites_app1_name": { "type": "String", "defaultValue": "app-one" },
+    "secret_app1_STORAGE": { "type": "securestring" },
+    "location": { "type": "string", "defaultValue": "eastus" },
+    "unused": { "type": "String", "defaultValue": "x" }
+  },
+  "resources": [
+    { "type": "Microsoft.KeyVault/vaults", "name": "[parameters('vaults_kv1_name')]", "location": "[parameters('location')]", "properties": {} },
+    { "type": "Microsoft.KeyVault/vaults/secrets", "name": "[concat(parameters('vaults_kv1_name'), '/alpha')]",
+      "dependsOn": [ "[resourceId('Microsoft.KeyVault/vaults', parameters('vaults_kv1_name'))]" ], "properties": {} },
+    { "type": "Microsoft.Web/serverfarms", "name": "[parameters('serverfarms_plan1_name')]", "location": "[parameters('location')]", "properties": {} },
+    { "type": "Microsoft.Web/sites", "name": "[parameters('sites_app1_name')]", "location": "[parameters('location')]",
+      "dependsOn": [ "[resourceId('Microsoft.Web/serverfarms', parameters('serverfarms_plan1_name'))]" ],
+      "properties": { "serverFarmId": "[resourceId('Microsoft.Web/serverfarms', parameters('serverfarms_plan1_name'))]",
+                      "siteConfig": { "appSettings": [ { "name": "STORAGE", "value": "[parameters('secret_app1_STORAGE')]" } ] } } },
+    { "type": "Microsoft.Web/sites/config", "name": "[concat(parameters('sites_app1_name'), '/web')]",
+      "dependsOn": [ "[resourceId('Microsoft.Web/sites', parameters('sites_app1_name'))]" ], "properties": {} },
+    { "type": "Microsoft.Sql/servers/databases", "name": "orphan-server/db1", "properties": {} }
+  ]
+}
+'@ | ConvertFrom-Json -AsHashtable -Depth 32
+
+$before = $whole | ConvertTo-Json -Depth 32 -Compress
+$parts = @(Split-RevEngTemplate -Template $whole)
+$byName = @{}; foreach ($p in $parts) { $byName[$p.Name] = $p }
+
+Assert-Equal 4 $parts.Count 'one file per top-level resource, plus one for the orphaned child'
+Assert-True ($byName.ContainsKey('kv-one') -and $byName.ContainsKey('app-one') -and $byName.ContainsKey('plan-one')) 'files are named after the real resource name, resolved from the parameter default'
+Assert-Equal 2 @($byName['kv-one'].Template['resources']).Count 'a Key Vault file carries its secrets'
+Assert-Equal 2 @($byName['app-one'].Template['resources']).Count 'a web app file carries its config child'
+Assert-True ($byName.ContainsKey('orphan-server/db1')) 'a child whose parent is not in the template still gets a file'
+
+$app = $byName['app-one'].Template
+Assert-False ($app['resources'][0].Contains('dependsOn')) 'a dependsOn pointing at another file is dropped (it would dangle)'
+Assert-Equal 1 @($app['resources'][1]['dependsOn']).Count 'a dependsOn on a resource in the same file is kept'
+Assert-Equal 1 $byName['app-one'].DependenciesDropped 'dropped dependencies are counted'
+$appParams = @($app['parameters'].Keys)
+Assert-True ($appParams -contains 'serverfarms_plan1_name') 'a parameter used only in a property reference is carried'
+Assert-True ($appParams -contains 'secret_app1_STORAGE') 'the secure parameter created by redaction is carried'
+Assert-True ($appParams -contains 'location') 'the location parameter is carried'
+Assert-False ($appParams -contains 'vaults_kv1_name') 'parameters of other resources are not'
+Assert-False (@($parts | ForEach-Object { @($_.Template['parameters'].Keys) }) -contains 'unused') 'an unreferenced parameter appears in no file'
+Assert-True (@($byName['kv-one'].Members) -contains "Microsoft.KeyVault/vaults/secrets|[concat(parameters('vaults_kv1_name'), '/alpha')]") 'members use the template-level map keys'
+Assert-Equal $before ($whole | ConvertTo-Json -Depth 32 -Compress) 'the input template is not modified'
+
+# Fallback when Azure refuses to export the resources together.
+$m = Merge-RevEngTemplate -Template @(
+    (@'
+{ "parameters": { "a_name": { "type": "String", "defaultValue": "a" } },
+  "resources": [ { "type": "T/x", "name": "[parameters('a_name')]" } ] }
+'@ | ConvertFrom-Json -AsHashtable),
+    (@'
+{ "parameters": { "a_name": { "type": "String", "defaultValue": "a" }, "b_name": { "type": "String", "defaultValue": "b" } },
+  "resources": [ { "type": "T/x", "name": "[parameters('a_name')]" }, { "type": "T/x", "name": "[parameters('b_name')]" } ] }
+'@ | ConvertFrom-Json -AsHashtable))
+Assert-Equal 2 @($m['resources']).Count 'merged templates keep each resource once'
+Assert-Equal 'a_name,b_name' (@($m['parameters'].Keys) -join ',') 'and union their parameters'
+
+# ---------------------------------------------------------------------------
 Test-Group 'Secret verdicts'
 $storageConn = 'DefaultEndpointsProtocol=https;AccountName=st1;AccountKey=abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH==;EndpointSuffix=core.windows.net'
 

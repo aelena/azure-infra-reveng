@@ -58,6 +58,7 @@ $global:MockResources = @(
     [pscustomobject]@{ Name = 'noexport';  ResourceType = 'Microsoft.Fake/unsupported';        Location = 'eastus'; ResourceId = "/subscriptions/$global:SUB/resourceGroups/$global:RG/providers/Microsoft.Fake/unsupported/noexport" }
 )
 $global:MockSalt = 'v1'
+$global:ExportCalls = 0
 
 # The plaintext secrets the run must never emit.
 $global:SecretPassword = 'Sup3rS3cret!e2e'
@@ -185,6 +186,7 @@ function global:Export-AzResourceGroup {
         [switch]$IncludeParameterDefaultValue, [switch]$SkipResourceNameParameterization, [switch]$Force,
         [Parameter(ValueFromRemainingArguments)]$Rest
     )
+    $global:ExportCalls++
     $wanted = if ($Resource) { $global:MockResources | Where-Object { $Resource -contains $_.ResourceId } } else { $global:MockResources }
     $bodies = @(); $params = @()
     foreach ($r in $wanted) {
@@ -224,6 +226,8 @@ try {
     $bicepRes = Join-Path $rgOut 'bicep/resources'
 
     Write-Host "`nRun 1 assertions" -ForegroundColor Cyan
+    # Whole RG fails on the unexportable type -> 4 single-resource probes -> one retry without it.
+    Assert-That ($global:ExportCalls -eq 6) "a failed whole-RG export is isolated with one probe per resource ($global:ExportCalls calls)"
     Assert-That (Test-Path (Join-Path $rgOut 'arm/main.json'))                       'the whole-RG ARM template exists (fell back past the unexportable resource)'
     Assert-That (Test-Path (Join-Path $rgOut 'bicep/main.bicep'))                    'the whole-RG Bicep template exists'
     Assert-That (Test-Path (Join-Path $rgOut 'bicep/main.sample.bicepparam'))        'a .bicepparam sample was emitted'
@@ -299,6 +303,22 @@ try {
 
     $summary = Get-Content -LiteralPath (Join-Path $reports 'summary.md') -Raw
     Assert-That ($summary -match 'Secret gate \| passed')                 'the secret gate passed'
+
+    # -----------------------------------------------------------------------
+    Write-Host "`n=== RUN 3+4: delta, nothing changed, everything exportable ===" -ForegroundColor Magenta
+    $global:MockResources = @($global:MockResources | Where-Object { $_.Name -ne 'noexport' })
+    & $exporter -ResourceGroupName $global:RG -OutputPath $outRoot -Mode Delta | Out-Null
+    $global:ExportCalls = 0
+    $stamps = @{}; foreach ($f in (Get-ChildItem $armRes -File)) { $stamps[$f.Name] = $f.LastWriteTimeUtc }
+    & $exporter -ResourceGroupName $global:RG -OutputPath $outRoot -Mode Delta | Out-Null
+
+    Write-Host "`nRun 3+4 assertions" -ForegroundColor Cyan
+    Assert-That ($global:ExportCalls -eq 1) "an exportable resource group costs exactly one export call ($global:ExportCalls)"
+    $rewritten = @(Get-ChildItem $armRes -File | Where-Object { $_.LastWriteTimeUtc -ne $stamps[$_.Name] })
+    Assert-That ($rewritten.Count -eq 0)                                  'an idle delta run rewrites no per-resource template'
+    Assert-That (@(Get-ChildItem $armRes -File).Count -eq 2)              'the per-resource library still holds both remaining resources'
+    $diff3 = Get-Content -LiteralPath (Join-Path $reports 'diff-report.json') -Raw | ConvertFrom-Json
+    Assert-That (@($diff3.modified).Count -eq 0 -and @($diff3.new).Count -eq 0) 'and reports no drift'
 }
 finally {
     if ($KeepOutput) {

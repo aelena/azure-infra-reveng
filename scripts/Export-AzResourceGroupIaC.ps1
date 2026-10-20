@@ -273,190 +273,115 @@ foreach ($id in $diff.Modified) {
 }
 
 $targetIds = if ($effectiveMode -eq 'Delta' -and -not $isBaseline) {
-    # Unknown resources are exported too - we could not prove they are unchanged.
+    # Unknown resources are refreshed too - we could not prove they are unchanged.
     @($diff.New) + @($diff.Modified) + @($diff.Unknown)
 } else {
     @($inventory.Keys)
 }
-Write-RevEngLog ("Exporting {0} resource template(s)." -f @($targetIds).Count)
 
 # =========================================================================
 # 3. Export ARM into the private working folder
+#
+# One whole-RG export, every run and in either mode. Per-resource templates are
+# cut out of it locally after sanitising, so there is one ARM export operation
+# instead of one per resource, and every transform runs exactly once.
 # =========================================================================
 Write-RevEngLog 'Exporting ARM from Azure' -Level Step
 
 $exportFailures = [System.Collections.Generic.List[object]]::new()
-$workItems = [System.Collections.Generic.List[object]]::new()
-$failedIds = [System.Collections.Generic.List[string]]::new()
 $mainNote = ''
+$mainWorkPath = Join-Path $paths.Work 'main.json'
+$mainExport = Export-RevEngArmTemplate -ResourceGroupName $ResourceGroupName -Path $mainWorkPath
 
-# Per-resource first, so that if the whole-RG export trips over an unexportable
-# resource type we already know which ids to leave out of the retry.
-$usedFileNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-foreach ($id in $targetIds) {
-    $meta = $inventory[$id]
-    $typeLeaf = ($meta['type'] -split '/')[-1]
-    $base = ConvertTo-RevEngSafeName -Name ("{0}_{1}" -f $typeLeaf, $meta['name'])
-    $fileName = $base
-    $n = 2
-    while (-not $usedFileNames.Add($fileName)) { $fileName = "${base}_$n"; $n++ }
+if (-not $mainExport.Success) {
+    # Azure fails the entire export when it meets a type it cannot serialise.
+    # Probe each resource on its own to find out which, then retry without them.
+    Write-RevEngLog ("whole-RG export failed: {0}" -f (@($mainExport.Errors) -join '; ')) -Level Warn
+    Write-RevEngLog ("probing {0} resource(s) one by one to isolate the unexportable ones..." -f $inventory.Count) -Level Warn
 
-    $work = Join-Path $paths.Work "$fileName.json"
-    $res = Export-RevEngArmTemplate -ResourceGroupName $ResourceGroupName -Path $work -ResourceId @($id)
-    if ($res.Success) {
-        Write-RevEngLog ("{0} [{1}]" -f $meta['name'], $meta['type']) -Level Ok
-        $workItems.Add([pscustomobject]@{
-            Kind = 'Resource'; Name = $meta['name']; WorkPath = $work
-            ArmPath = (Join-Path $paths.ArmResources "$fileName.json")
-            BicepPath = (Join-Path $paths.BicepResources "$fileName.bicep")
-        })
-    } else {
-        Write-RevEngLog ("{0} [{1}]: {2}" -f $meta['name'], $meta['type'], ($res.Errors -join '; ')) -Level Err
-        $exportFailures.Add([pscustomobject]@{ Resource = $meta['name']; Type = $meta['type']; Errors = $res.Errors })
-        $failedIds.Add([string]$id)
+    $probeTemplates = [System.Collections.Generic.List[object]]::new()
+    $exportableIds = [System.Collections.Generic.List[string]]::new()
+    $n = 0
+    foreach ($id in @($inventory.Keys)) {
+        $n++
+        $meta = $inventory[$id]
+        $probe = Export-RevEngArmTemplate -ResourceGroupName $ResourceGroupName -Path (Join-Path $paths.Work "probe-$n.json") -ResourceId @($id)
+        if ($probe.Success) {
+            $exportableIds.Add([string]$id)
+            $probeTemplates.Add((Get-Content -LiteralPath $probe.Path -Raw | ConvertFrom-Json -AsHashtable -Depth 64))
+        } else {
+            Write-RevEngLog ("{0} [{1}]: {2}" -f $meta['name'], $meta['type'], ($probe.Errors -join '; ')) -Level Err
+            $exportFailures.Add([pscustomobject]@{ Resource = $meta['name']; Type = $meta['type']; Errors = $probe.Errors })
+        }
     }
-}
 
-# Whole-RG template last, with a fallback: Azure fails the entire export when it
-# meets a resource type it cannot serialise, so retry without the known-bad ones
-# rather than losing main.json altogether.
-$fullWorkPath = Join-Path $paths.Work 'main.json'
-$fullExport = Export-RevEngArmTemplate -ResourceGroupName $ResourceGroupName -Path $fullWorkPath
-
-if (-not $fullExport.Success -and $failedIds.Count -gt 0) {
-    $retryIds = @($inventory.Keys | Where-Object { $_ -notin $failedIds })
-    if ($retryIds.Count -gt 0) {
-        Write-RevEngLog ("whole-RG export failed; retrying without {0} unexportable resource(s)..." -f $failedIds.Count) -Level Warn
-        $fullExport = Export-RevEngArmTemplate -ResourceGroupName $ResourceGroupName -Path $fullWorkPath -ResourceId $retryIds
-        if ($fullExport.Success) {
-            $mainNote = "main.json excludes $($failedIds.Count) resource(s) that Azure cannot export - see the failure list below."
+    if ($exportableIds.Count -gt 0) {
+        $mainExport = Export-RevEngArmTemplate -ResourceGroupName $ResourceGroupName -Path $mainWorkPath -ResourceId $exportableIds.ToArray()
+        if ($mainExport.Success) {
+            $mainNote = "main.json excludes $($exportFailures.Count) resource(s) that Azure cannot export - see the failure list in portability-report.md."
+        } else {
+            # Last resort, e.g. past the export size limit: stitch the probes together.
+            Write-RevEngLog ("export of the {0} exportable resource(s) failed too: {1}" -f $exportableIds.Count, (@($mainExport.Errors) -join '; ')) -Level Warn
+            Write-RevEngJsonFile -InputObject (Merge-RevEngTemplate -Template $probeTemplates.ToArray()) -Path $mainWorkPath | Out-Null
+            $mainExport = [pscustomobject]@{ Success = $true; Path = $mainWorkPath; Errors = @() }
+            $mainNote = "main.json was assembled from $($exportableIds.Count) per-resource export(s) because Azure would not export them together. " +
+                        'Child resources that Get-AzResource does not enumerate (Key Vault secrets, DNS records, ...) may be missing from it.'
         }
     }
 }
 
-if ($fullExport.Success) {
-    Write-RevEngLog ('whole resource group -> main.json' + $(if ($mainNote) { ' (partial)' })) -Level Ok
-    if ($mainNote) { Write-RevEngLog $mainNote -Level Warn }
-    foreach ($e in $fullExport.Errors) { Write-RevEngLog $e -Level Warn }
-    $workItems.Add([pscustomobject]@{
-        Kind = 'Main'; Name = 'main'; WorkPath = $fullWorkPath
-        ArmPath = (Join-Path $paths.Arm 'main.json')
-        BicepPath = (Join-Path $paths.Bicep 'main.bicep')
-    })
-} else {
-    Write-RevEngLog ("whole-RG export failed: {0}" -f (@($fullExport.Errors) -join '; ')) -Level Err
-    Write-RevEngLog 'Per-resource templates are still usable; only the combined template is missing.' -Level Warn
-    $exportFailures.Add([pscustomobject]@{ Resource = '(whole resource group)'; Type = '-'; Errors = $fullExport.Errors })
-}
-
-if ($workItems.Count -eq 0) {
+if (-not $mainExport.Success) {
     throw 'Every ARM export failed - nothing to process. See the errors above.'
 }
+Write-RevEngLog ('whole resource group -> main.json' + $(if ($mainNote) { ' (partial)' })) -Level Ok
+if ($mainNote) { Write-RevEngLog $mainNote -Level Warn }
+foreach ($e in $mainExport.Errors) { Write-RevEngLog $e -Level Warn }
 
 # =========================================================================
-# 4. Redact secrets + apply portability transforms (in memory)
+# 4. Normalise, redact secrets and apply portability transforms (in memory)
 # =========================================================================
 Write-RevEngLog 'Redacting secrets and applying portability transforms' -Level Step
 
-$allRedactions   = [System.Collections.Generic.List[object]]::new()
-$allDynamicRefs  = [System.Collections.Generic.List[object]]::new()
-$allOutputRisks  = [System.Collections.Generic.List[object]]::new()
-$allFindings     = [System.Collections.Generic.List[object]]::new()
-$allStripped     = [System.Collections.Generic.List[object]]::new()
-$residualLeaks   = [System.Collections.Generic.List[object]]::new()
-$externalDeps    = [System.Collections.Generic.List[string]]::new()
-$processed       = [System.Collections.Generic.List[object]]::new()
+$rawJson = Get-Content -LiteralPath $mainWorkPath -Raw
+$template = $rawJson | ConvertFrom-Json -AsHashtable -Depth 64
 
-# Every resource is processed twice - once in its own template and once inside
-# main.json - so findings are deduplicated on insertion. The resources[N] index
-# differs between the two, hence the path normalisation.
-$ic = [StringComparer]::OrdinalIgnoreCase
-$seenRedaction = [System.Collections.Generic.HashSet[string]]::new($ic)
-$seenDynamic   = [System.Collections.Generic.HashSet[string]]::new($ic)
-$seenOutput    = [System.Collections.Generic.HashSet[string]]::new($ic)
-$seenFinding   = [System.Collections.Generic.HashSet[string]]::new($ic)
-$seenStripped  = [System.Collections.Generic.HashSet[string]]::new($ic)
-$seenNoise     = [System.Collections.Generic.HashSet[string]]::new($ic)
-$seenInline    = [System.Collections.Generic.HashSet[string]]::new($ic)
-$normPath = { param($p) [regex]::Replace([string]$p, 'resources\[\d+\]', 'resources[]') }
-
-$noiseRemoved = [System.Collections.Generic.List[object]]::new()
-$inlineRemoved = [System.Collections.Generic.List[object]]::new()
-$depsRepaired = 0
+# Normalise before anything else: this can drop the large majority of the
+# resources (Azure-managed children), so everything downstream gets cheaper.
 $excludeChildTypes = @(Get-RevEngConfigValue -Config $filters -Path 'excludeChildTypes' -Default @())
 $inlineRules = @(Get-RevEngConfigValue -Config $portabilityCfg -Path 'redundantInlineChildren' -Default @())
 
-foreach ($item in $workItems) {
-    $rawJson = Get-Content -LiteralPath $item.WorkPath -Raw
-    $template = $rawJson | ConvertFrom-Json -AsHashtable -Depth 64
+$noisePass = Remove-RevEngNoiseResource -Template $template -ExcludeType $excludeChildTypes
+$inlinePass = Remove-RevEngRedundantInlineChild -Template $noisePass.Template -Rule $inlineRules
+$noiseRemoved = @($noisePass.Removed)
+$inlineRemoved = @($inlinePass.Removed)
+$depsRepaired = $noisePass.DependenciesRepaired + $inlinePass.DependenciesRepaired
 
-    # Normalise before anything else: this can drop the large majority of the
-    # resources (Azure-managed children), so everything downstream gets cheaper.
-    # Deduped like every other finding: each resource is normalised twice, once in
-    # its own template and once inside main.json, so a raw tally would double it.
-    $noisePass = Remove-RevEngNoiseResource -Template $template -ExcludeType $excludeChildTypes
-    $depsRepaired += $noisePass.DependenciesRepaired
-    foreach ($n in $noisePass.Removed) {
-        # Inner parentheses are required: inside a method call the comma would
-        # otherwise be read as an argument separator, not as -f's argument list.
-        if ($seenNoise.Add(('{0}|{1}' -f $n.Type, $n.Name))) { $noiseRemoved.Add($n) }
-    }
+$secretPass = Remove-RevEngSecretMaterial -Template $inlinePass.Template -SecretConfig $secretConfig `
+    -Policy $secretPolicy -Placeholder $placeholder
+$allRedactions = @($secretPass.Redactions)
+$allDynamicRefs = @($secretPass.DynamicReferences)
+$allOutputRisks = @($secretPass.OutputRisks)
 
-    $inlinePass = Remove-RevEngRedundantInlineChild -Template $noisePass.Template -Rule $inlineRules
-    $depsRepaired += $inlinePass.DependenciesRepaired
-    foreach ($n in $inlinePass.Removed) {
-        if ($seenInline.Add(('{0}|{1}' -f $n.Type, $n.Name))) { $inlineRemoved.Add($n) }
-    }
-    $template = $inlinePass.Template
+$portPass = Convert-RevEngTemplateForPortability -Template $secretPass.Template `
+    -PortabilityConfig $portabilityCfg `
+    -SourceSubscriptionId $sourceSubscriptionId `
+    -SourceTenantId $sourceTenantId `
+    -SourceResourceGroupName $ResourceGroupName `
+    -PrimaryLocation $primaryLocation
+$allFindings = @($portPass.Findings)
+$allStripped = @($portPass.Stripped)
+$mainTemplate = $portPass.Template
+$mainJson = $mainTemplate | ConvertTo-Json -Depth 64
 
-    $secretPass = Remove-RevEngSecretMaterial -Template $template -SecretConfig $secretConfig `
-        -Policy $secretPolicy -Placeholder $placeholder
-    foreach ($r in $secretPass.Redactions) {
-        $k = '{0}|{1}|{2}|{3}|{4}' -f $r.ResourceType, $r.ResourceName, $r.Property, (& $normPath $r.Path), $r.ValueFingerprint
-        if ($seenRedaction.Add($k)) { $allRedactions.Add($r) }
-    }
-    foreach ($r in $secretPass.DynamicReferences) {
-        $k = '{0}|{1}|{2}|{3}' -f $r.ResourceType, $r.ResourceName, $r.Property, (& $normPath $r.Path)
-        if ($seenDynamic.Add($k)) { $allDynamicRefs.Add($r) }
-    }
-    foreach ($r in $secretPass.OutputRisks) {
-        if ($seenOutput.Add([string]$r.Output)) { $allOutputRisks.Add($r) }
-    }
+# Secret gate: scan the *rendered* output, which is what would hit disk. Every
+# per-resource file is cut out of this template, so it covers those too.
+$residualLeaks = [System.Collections.Generic.List[object]]::new()
+foreach ($l in (Test-RevEngSecretLeak -Content $mainJson -SecretConfig $secretConfig -Source 'main.json')) { $residualLeaks.Add($l) }
 
-    $portPass = Convert-RevEngTemplateForPortability -Template $secretPass.Template `
-        -PortabilityConfig $portabilityCfg `
-        -SourceSubscriptionId $sourceSubscriptionId `
-        -SourceTenantId $sourceTenantId `
-        -SourceResourceGroupName $ResourceGroupName `
-        -PrimaryLocation $primaryLocation
-    foreach ($f in $portPass.Findings) {
-        $k = '{0}|{1}|{2}|{3}|{4}' -f $f.Category, $f.ResourceType, $f.ResourceName, (& $normPath $f.Path), $f.Detail
-        if ($seenFinding.Add($k)) { $allFindings.Add($f) }
-    }
-    foreach ($s in $portPass.Stripped) {
-        $k = '{0}|{1}|{2}|{3}' -f $s.ResourceName, $s.Property, (& $normPath $s.Path), $s.Reason
-        if ($seenStripped.Add($k)) { $allStripped.Add($s) }
-    }
-
-    $json = $portPass.Template | ConvertTo-Json -Depth 64
-
-    # Secret gate: scan the *rendered* output, which is what would hit disk.
-    $leaks = Test-RevEngSecretLeak -Content $json -SecretConfig $secretConfig -Source (Split-Path -Leaf $item.ArmPath)
-    foreach ($l in $leaks) { $residualLeaks.Add($l) }
-
-    # Scanned on the raw export, not the transformed template: by now the literal
-    # subscription id has become subscription().subscriptionId, so a resource-id
-    # match is no longer possible. Only resource ids are recorded, never values.
-    foreach ($d in (Get-RevEngExternalDependency -TemplateJson $rawJson -SourceResourceGroupName $ResourceGroupName)) {
-        if (-not $externalDeps.Contains($d)) { $externalDeps.Add($d) }
-    }
-
-    $processed.Add([pscustomobject]@{
-        Item     = $item
-        Template = $portPass.Template
-        Json     = $json
-    })
-}
+# Scanned on the raw export, not the transformed template: by now the literal
+# subscription id has become subscription().subscriptionId, so a resource-id
+# match is no longer possible. Only resource ids are recorded, never values.
+$externalDeps = @(Get-RevEngExternalDependency -TemplateJson $rawJson -SourceResourceGroupName $ResourceGroupName)
 
 if ($noiseRemoved.Count -gt 0 -or $inlineRemoved.Count -gt 0) {
     $noiseTypes = @($noiseRemoved | Group-Object Type | Sort-Object Count -Descending)
@@ -488,27 +413,131 @@ if ($residualLeaks.Count -gt 0) {
     Write-RevEngLog 'Continuing anyway because residual secrets were explicitly allowed.' -Level Warn
 }
 
+# --- Child-level drift, from the whole-RG template ------------------------
+# Get-AzResource does not enumerate most child resources, so the per-resource
+# fingerprints above cannot see them. The whole-RG template can, and it is
+# refreshed on every run including Delta.
+$templateMap = Get-RevEngTemplateResourceMap -Template $mainTemplate
+$previousTemplateMap = Get-RevEngConfigValue -Config $previousState -Path 'templateResources' -Default (New-RevEngOrderedMap)
+$childDiff = $null
+if ($previousTemplateMap.Count -gt 0) {
+    $childDiff = Compare-RevEngSnapshot -Current $templateMap -Previous $previousTemplateMap
+    $childTotal = $childDiff.New.Count + $childDiff.Modified.Count + $childDiff.Removed.Count
+
+    Write-RevEngLog 'Change summary - template level (includes child resources)' -Level Step
+    Write-RevEngLog ("Tracked   : {0} resource(s) in the whole-RG template" -f $templateMap.Count)
+    if ($childTotal -eq 0) {
+        Write-RevEngLog 'No child-level changes.' -Level Ok
+    } else {
+        Write-RevEngLog ("New       : {0}" -f $childDiff.New.Count)      -Level $(if ($childDiff.New.Count)      { 'Ok' }   else { 'Info' })
+        Write-RevEngLog ("Modified  : {0}" -f $childDiff.Modified.Count) -Level $(if ($childDiff.Modified.Count) { 'Warn' } else { 'Info' })
+        Write-RevEngLog ("Removed   : {0}" -f $childDiff.Removed.Count)  -Level $(if ($childDiff.Removed.Count)  { 'Err' }  else { 'Info' })
+        foreach ($k in $childDiff.New)      { Write-RevEngLog ("new:     {0} [{1}]" -f $templateMap[$k]['name'], $templateMap[$k]['type']) -Level Ok }
+        foreach ($k in $childDiff.Modified) { Write-RevEngLog ("changed: {0} [{1}]" -f $templateMap[$k]['name'], $templateMap[$k]['type']) -Level Warn }
+        foreach ($k in $childDiff.Removed)  { Write-RevEngLog ("removed: {0} [{1}]" -f $previousTemplateMap[$k]['name'], $previousTemplateMap[$k]['type']) -Level Err }
+    }
+} else {
+    Write-RevEngLog ("Template-level baseline recorded: {0} resource(s) including children." -f $templateMap.Count)
+}
+
 # =========================================================================
-# 5. Emit sanitised ARM + Bicep
+# 5. Emit sanitised ARM: main.json, then one file per top-level resource
 # =========================================================================
 Write-RevEngLog 'Writing sanitised ARM' -Level Step
-foreach ($p in $processed) {
-    Write-RevEngTextFile -Content $p.Json -Path $p.Item.ArmPath
-}
-Write-RevEngLog ("{0} ARM template(s) written." -f $processed.Count) -Level Ok
+Write-RevEngTextFile -Content $mainJson -Path (Join-Path $paths.Arm 'main.json')
+Write-RevEngLog 'main.json' -Level Ok
 
+$parts = @(Split-RevEngTemplate -Template $mainTemplate)
+
+# In Delta mode a file is rewritten when its top-level resource changed, or when
+# any of its children changed at template level (which level 1 cannot see).
+$targetKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($id in $targetIds) { [void]$targetKeys.Add(('{0}|{1}' -f $inventory[$id]['type'], $inventory[$id]['name'])) }
+$changedMembers = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+if ($childDiff) { foreach ($k in @($childDiff.New) + @($childDiff.Modified)) { [void]$changedMembers.Add([string]$k) } }
+$writeAll = ($effectiveMode -ne 'Delta' -or $isBaseline -or -not $childDiff)
+
+$usedFileNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$resourceFiles = [System.Collections.Generic.List[object]]::new()
+$splitDepsDropped = 0
+foreach ($part in $parts) {
+    $base = ConvertTo-RevEngSafeName -Name ('{0}_{1}' -f (($part.Type -split '/')[-1]), $part.Name)
+    $fileName = $base
+    $n = 2
+    while (-not $usedFileNames.Add($fileName)) { $fileName = "${base}_$n"; $n++ }
+
+    # Remembered on the inventory entry, so a later run can prune exactly this file.
+    foreach ($id in @($inventory.Keys)) {
+        if ($inventory[$id]['type'] -ieq $part.Type -and $inventory[$id]['name'] -ieq $part.Name) { $inventory[$id]['file'] = $fileName }
+    }
+
+    $wanted = $writeAll -or $targetKeys.Contains(('{0}|{1}' -f $part.Type, $part.Name)) -or
+              @($part.Members | Where-Object { $changedMembers.Contains($_) }).Count -gt 0
+    if (-not $wanted) { continue }
+
+    $splitDepsDropped += $part.DependenciesDropped
+    $armPath = Join-Path $paths.ArmResources "$fileName.json"
+    Write-RevEngTextFile -Content ($part.Template | ConvertTo-Json -Depth 64) -Path $armPath
+    $resourceFiles.Add([pscustomobject]@{
+        Name      = $part.Name
+        Type      = $part.Type
+        ArmPath   = $armPath
+        BicepPath = (Join-Path $paths.BicepResources "$fileName.bicep")
+    })
+}
+Write-RevEngLog ("{0} per-resource template(s) written, of {1} in the resource group." -f $resourceFiles.Count, $parts.Count) -Level Ok
+if ($splitDepsDropped -gt 0) {
+    Write-RevEngLog ("{0} dependsOn entr(ies) pointing outside their own file were dropped from the per-resource copies; main.json keeps them." -f $splitDepsDropped)
+}
+
+# --- Prune templates for resources that no longer exist -------------------
+# Without this the per-resource library keeps claiming a resource that no longer
+# exists, which is exactly the drift the exporter is supposed to surface. Full
+# mode mirrors the template; Delta removes what the diff says was deleted.
+$staleFiles = [System.Collections.Generic.List[string]]::new()
+if ($writeAll) {
+    foreach ($dir in @($paths.ArmResources, $paths.BicepResources)) {
+        if (-not (Test-Path -LiteralPath $dir)) { continue }
+        foreach ($f in (Get-ChildItem -LiteralPath $dir -File)) {
+            if (-not $usedFileNames.Contains($f.BaseName)) { $staleFiles.Add($f.FullName) }
+        }
+    }
+} else {
+    foreach ($id in $diff.Removed) {
+        $meta = $previousResources[$id]
+        $base = if (Test-RevEngHasKey $meta 'file') { [string]$meta['file'] } else {
+            ConvertTo-RevEngSafeName -Name ('{0}_{1}' -f (([string]$meta['type'] -split '/')[-1]), $meta['name'])
+        }
+        if ($usedFileNames.Contains($base)) { continue }
+        foreach ($stale in @((Join-Path $paths.ArmResources "$base.json"), (Join-Path $paths.BicepResources "$base.bicep"))) {
+            if (Test-Path -LiteralPath $stale) { $staleFiles.Add($stale) }
+        }
+    }
+}
+if ($staleFiles.Count -gt 0) {
+    Write-RevEngLog 'Pruning templates for removed resources' -Level Step
+    foreach ($stale in $staleFiles) {
+        Remove-Item -LiteralPath $stale -Force
+        Write-RevEngLog ('pruned {0}' -f (Split-Path -Leaf $stale)) -Level Warn
+    }
+}
+
+# =========================================================================
+# 6. Decompile to Bicep
+# =========================================================================
 $bicepFailures = [System.Collections.Generic.List[object]]::new()
 $bicepWarnings = [System.Collections.Generic.List[object]]::new()
 if ($emitBicep) {
     Write-RevEngLog 'Decompiling to Bicep' -Level Step
-    foreach ($p in $processed) {
-        $r = Convert-RevEngArmToBicep -ArmPath $p.Item.ArmPath -BicepPath $p.Item.BicepPath
+    $toDecompile = @([pscustomobject]@{ ArmPath = (Join-Path $paths.Arm 'main.json'); BicepPath = (Join-Path $paths.Bicep 'main.bicep') }) + @($resourceFiles)
+    foreach ($p in $toDecompile) {
+        $r = Convert-RevEngArmToBicep -ArmPath $p.ArmPath -BicepPath $p.BicepPath
         if ($r.Success) {
-            Write-RevEngLog (Split-Path -Leaf $p.Item.BicepPath) -Level Ok
-            if ($r.Message) { $bicepWarnings.Add([pscustomobject]@{ File = (Split-Path -Leaf $p.Item.BicepPath); Message = $r.Message }) }
+            Write-RevEngLog (Split-Path -Leaf $p.BicepPath) -Level Ok
+            if ($r.Message) { $bicepWarnings.Add([pscustomobject]@{ File = (Split-Path -Leaf $p.BicepPath); Message = $r.Message }) }
         } else {
-            Write-RevEngLog ("decompile failed: {0} - {1}" -f (Split-Path -Leaf $p.Item.ArmPath), $r.Message) -Level Err
-            $bicepFailures.Add([pscustomobject]@{ File = (Split-Path -Leaf $p.Item.ArmPath); Message = $r.Message })
+            Write-RevEngLog ("decompile failed: {0} - {1}" -f (Split-Path -Leaf $p.ArmPath), $r.Message) -Level Err
+            $bicepFailures.Add([pscustomobject]@{ File = (Split-Path -Leaf $p.ArmPath); Message = $r.Message })
         }
     }
 
@@ -535,66 +564,15 @@ if ($emitBicep) {
     }
 }
 
-# --- Child-level drift, from the whole-RG template ------------------------
-# Get-AzResource does not enumerate most child resources, so the per-resource
-# fingerprints above cannot see them. The whole-RG template can, and it is
-# refreshed on every run including Delta.
-$templateMap = New-RevEngOrderedMap
-$childDiff = $null
-$mainForMap = $processed | Where-Object { $_.Item.Kind -eq 'Main' } | Select-Object -First 1
-if ($mainForMap) {
-    $templateMap = Get-RevEngTemplateResourceMap -Template $mainForMap.Template
-    $previousTemplateMap = Get-RevEngConfigValue -Config $previousState -Path 'templateResources' -Default (New-RevEngOrderedMap)
-
-    if ($previousTemplateMap.Count -gt 0) {
-        $childDiff = Compare-RevEngSnapshot -Current $templateMap -Previous $previousTemplateMap
-        $childTotal = $childDiff.New.Count + $childDiff.Modified.Count + $childDiff.Removed.Count
-
-        Write-RevEngLog 'Change summary - template level (includes child resources)' -Level Step
-        Write-RevEngLog ("Tracked   : {0} resource(s) in the whole-RG template" -f $templateMap.Count)
-        if ($childTotal -eq 0) {
-            Write-RevEngLog 'No child-level changes.' -Level Ok
-        } else {
-            Write-RevEngLog ("New       : {0}" -f $childDiff.New.Count)      -Level $(if ($childDiff.New.Count)      { 'Ok' }   else { 'Info' })
-            Write-RevEngLog ("Modified  : {0}" -f $childDiff.Modified.Count) -Level $(if ($childDiff.Modified.Count) { 'Warn' } else { 'Info' })
-            Write-RevEngLog ("Removed   : {0}" -f $childDiff.Removed.Count)  -Level $(if ($childDiff.Removed.Count)  { 'Err' }  else { 'Info' })
-            foreach ($k in $childDiff.New)      { Write-RevEngLog ("new:     {0} [{1}]" -f $templateMap[$k]['name'], $templateMap[$k]['type']) -Level Ok }
-            foreach ($k in $childDiff.Modified) { Write-RevEngLog ("changed: {0} [{1}]" -f $templateMap[$k]['name'], $templateMap[$k]['type']) -Level Warn }
-            foreach ($k in $childDiff.Removed)  { Write-RevEngLog ("removed: {0} [{1}]" -f $previousTemplateMap[$k]['name'], $previousTemplateMap[$k]['type']) -Level Err }
-        }
-    } else {
-        Write-RevEngLog ("Template-level baseline recorded: {0} resource(s) including children." -f $templateMap.Count)
-    }
-}
-
-# --- Prune templates for deleted resources -------------------------------
-# Without this the per-resource library keeps claiming a resource that no longer
-# exists, which is exactly the drift the exporter is supposed to surface.
-if ($diff.Removed.Count -gt 0) {
-    Write-RevEngLog 'Pruning templates for removed resources' -Level Step
-    foreach ($id in $diff.Removed) {
-        $meta = $previousResources[$id]
-        $leaf = ([string]$meta['type'] -split '/')[-1]
-        $base = ConvertTo-RevEngSafeName -Name ('{0}_{1}' -f $leaf, $meta['name'])
-        foreach ($stale in @((Join-Path $paths.ArmResources "$base.json"), (Join-Path $paths.BicepResources "$base.bicep"))) {
-            if (Test-Path -LiteralPath $stale) {
-                Remove-Item -LiteralPath $stale -Force
-                Write-RevEngLog ('pruned {0}' -f (Split-Path -Leaf $stale)) -Level Warn
-            }
-        }
-    }
-}
-
 # --- Parameter files + deploy helper -------------------------------------
-$mainProcessed = $processed | Where-Object { $_.Item.Kind -eq 'Main' } | Select-Object -First 1
 $paramInfo = $null
-if ($mainProcessed) {
+if ($mainTemplate) {
     Write-RevEngLog 'Emitting parameter files and deploy helper' -Level Step
 
     # The same parameter file serves both flavours, so write it under arm/ (which
     # always exists) and copy it next to the Bicep only when Bicep was emitted.
     $armParamPath = Join-Path $paths.Arm 'main.parameters.sample.json'
-    $paramInfo = New-RevEngParameterFile -Template $mainProcessed.Template `
+    $paramInfo = New-RevEngParameterFile -Template $mainTemplate `
         -JsonPath $armParamPath `
         -BicepParamPath $(if ($emitBicep) { Join-Path $paths.Bicep 'main.sample.bicepparam' } else { '' }) `
         -BicepTemplateName 'main.bicep'
@@ -839,7 +817,7 @@ $sm.Add("| Source subscription | ``$sourceSubscriptionId`` |")
 $sm.Add("| Source tenant | ``$sourceTenantId`` |")
 $sm.Add("| Source region | $primaryLocation |")
 $sm.Add("| Resources in scope | $($inventory.Count) |")
-$sm.Add("| Templates exported | $($processed.Count) |")
+$sm.Add("| Per-resource templates written | $($resourceFiles.Count) of $($parts.Count) |")
 $sm.Add("| New / Modified / Removed | $($diff.New.Count) / $($diff.Modified.Count) / $($diff.Removed.Count) |")
 if ($diff.Unknown.Count -gt 0) {
     $sm.Add("| **Could not be fingerprinted** | **$($diff.Unknown.Count)** - drift cannot be ruled out, see diff-report.json |")
