@@ -175,10 +175,60 @@ function Get-RevEngShortHash {
     } finally { $sha.Dispose() }
 }
 
+function ConvertTo-RevEngCanonicalObject {
+    <#
+    .SYNOPSIS
+        Rebuilds an object tree with every dictionary and object property sorted
+        by name, so its JSON is byte-identical whenever its content is.
+    .DESCRIPTION
+        Fingerprints used to hash ConvertTo-Json output directly. That is only
+        stable for ordered maps: Get-AzResource returns Tags as a plain
+        Hashtable, and .NET randomises string hash codes per process, so a
+        resource with two or more tags serialised in a different key order on
+        every run and was reported as modified each time. Arrays keep their
+        order - in ARM it is meaningful.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$InputObject,
+        [int]$Depth = 32
+    )
+
+    if ($null -eq $InputObject) { return $null }
+    if ($InputObject -is [string] -or $InputObject -is [ValueType]) {
+        if ($InputObject -is [datetime] -or $InputObject -is [datetimeoffset]) { return $InputObject.ToString('o') }
+        if ($InputObject -is [enum]) { return [string]$InputObject }
+        return $InputObject
+    }
+    if ($Depth -le 0) { return [string]$InputObject }
+
+    $sorted = [System.Management.Automation.OrderedHashtable]::new()
+    if (Test-RevEngIsDictionary $InputObject) {
+        # Ordinal, not Sort-Object: culture-aware ordering differs between machines.
+        $keys = [string[]]@($InputObject.Keys | ForEach-Object { [string]$_ })
+        [Array]::Sort($keys, [StringComparer]::Ordinal)
+        foreach ($k in $keys) {
+            $sorted[$k] = ConvertTo-RevEngCanonicalObject -InputObject $InputObject[$k] -Depth ($Depth - 1)
+        }
+        return $sorted
+    }
+    if ($InputObject -is [System.Collections.IEnumerable]) {
+        # The leading comma keeps a one-element array from being unrolled.
+        return , @(foreach ($item in $InputObject) { ConvertTo-RevEngCanonicalObject -InputObject $item -Depth ($Depth - 1) })
+    }
+    $names = [string[]]@($InputObject.PSObject.Properties | ForEach-Object { $_.Name })
+    [Array]::Sort($names, [StringComparer]::Ordinal)
+    foreach ($n in $names) {
+        $sorted[$n] = ConvertTo-RevEngCanonicalObject -InputObject $InputObject.$n -Depth ($Depth - 1)
+    }
+    return $sorted
+}
+
 function Get-RevEngObjectHash {
     [CmdletBinding()]
     param([Parameter(Mandatory)][AllowNull()]$InputObject)
-    $json = $InputObject | ConvertTo-Json -Depth 25 -Compress
+    $canonical = ConvertTo-RevEngCanonicalObject -InputObject $InputObject
+    $json = ConvertTo-Json -InputObject $canonical -Depth 64 -Compress
     if ($null -eq $json) { $json = '' }
     return Get-RevEngShortHash -Value ([string]$json) -Length 64
 }
@@ -1316,30 +1366,36 @@ function Compare-RevEngSnapshot {
         [Parameter(Mandatory)]$Current,
         [Parameter(Mandatory)]$Previous
     )
-    $currentIds = @($Current.Keys)
-    $previousIds = @($Previous.Keys)
+    # Set lookups, not -in/-notin over arrays: those are linear, which made the
+    # diff quadratic on the template-level map of a large resource group.
+    $ic = [StringComparer]::OrdinalIgnoreCase
+    $currentIds = [System.Collections.Generic.HashSet[string]]::new([string[]]@($Current.Keys), $ic)
+    $previousIds = [System.Collections.Generic.HashSet[string]]::new([string[]]@($Previous.Keys), $ic)
 
-    $new = @($currentIds | Where-Object { $_ -notin $previousIds })
-    $removed = @($previousIds | Where-Object { $_ -notin $currentIds })
-    $common = @($currentIds | Where-Object { $_ -in $previousIds })
+    $new = [System.Collections.Generic.List[string]]::new()
+    $modified = [System.Collections.Generic.List[string]]::new()
+    $unchanged = [System.Collections.Generic.List[string]]::new()
+    $unknown = [System.Collections.Generic.List[string]]::new()
 
-    # A missing hash on either side means "we could not tell", which is neither
-    # unchanged nor modified. Calling it either way is a lie: unchanged hides a
-    # possible drift, modified cries wolf on every subsequent run.
-    $unknown = @($common | Where-Object {
-        [string]::IsNullOrEmpty([string]$Current[$_]['hash']) -or
-        [string]::IsNullOrEmpty([string]$Previous[$_]['hash'])
-    })
-    $comparable = @($common | Where-Object { $_ -notin $unknown })
-    $modified = @($comparable | Where-Object { $Current[$_]['hash'] -ne $Previous[$_]['hash'] })
-    $unchanged = @($comparable | Where-Object { $_ -notin $modified })
+    foreach ($id in @($Current.Keys)) {
+        if (-not $previousIds.Contains($id)) { $new.Add($id); continue }
+        $now = [string]$Current[$id]['hash']
+        $before = [string]$Previous[$id]['hash']
+        # A missing hash on either side means "we could not tell", which is
+        # neither unchanged nor modified. Calling it either way is a lie:
+        # unchanged hides a possible drift, modified cries wolf on every run.
+        if ([string]::IsNullOrEmpty($now) -or [string]::IsNullOrEmpty($before)) { $unknown.Add($id) }
+        elseif ($now -ne $before) { $modified.Add($id) }
+        else { $unchanged.Add($id) }
+    }
+    $removed = @(@($Previous.Keys) | Where-Object { -not $currentIds.Contains([string]$_) })
 
     return [pscustomobject]@{
-        New       = $new
-        Modified  = $modified
-        Removed   = $removed
-        Unchanged = $unchanged
-        Unknown   = $unknown
+        New       = $new.ToArray()
+        Modified  = $modified.ToArray()
+        Removed   = [string[]]$removed
+        Unchanged = $unchanged.ToArray()
+        Unknown   = $unknown.ToArray()
     }
 }
 
@@ -1873,6 +1929,7 @@ Export-ModuleMember -Function @(
     'ConvertTo-RevEngParameterName'
     'Get-RevEngResourceLabel'
     'Get-RevEngShortHash'
+    'ConvertTo-RevEngCanonicalObject'
     'Get-RevEngObjectHash'
     'Copy-RevEngJsonObject'
     'Invoke-RevEngTreeVisit'

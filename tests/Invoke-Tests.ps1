@@ -411,6 +411,32 @@ $dp = Compare-RevEngSnapshot -Current $prev -Previous $prevUnknown
 Assert-Equal '/rid/a' ($dp.Unknown -join ',') 'a missing fingerprint in the PREVIOUS run is Unknown too'
 
 # ---------------------------------------------------------------------------
+Test-Group 'Canonical fingerprints (Hashtable key order is randomised per process)'
+
+# Same content, opposite insertion order. A plain Hashtable's enumeration order
+# depends on string hash codes, which .NET randomises per process - so only a
+# canonical form makes the fingerprint reproducible across runs.
+$tagsA = [ordered]@{ env = 'prod'; owner = 'ops'; app = 'x' }
+$tagsB = [ordered]@{ app = 'x'; owner = 'ops'; env = 'prod' }
+$objA = [pscustomobject]@{ Kind = 'StorageV2'; Tags = $tagsA; Properties = [pscustomobject]@{ b = 1; a = @(3, 1, 2) } }
+$objB = [pscustomobject]@{ Properties = [pscustomobject]@{ a = @(3, 1, 2); b = 1 }; Tags = $tagsB; Kind = 'StorageV2' }
+Assert-Equal (Get-RevEngObjectHash -InputObject $objA) (Get-RevEngObjectHash -InputObject $objB) 'key and property order do not change the fingerprint'
+
+$objC = [pscustomobject]@{ Kind = 'StorageV2'; Tags = $tagsA; Properties = [pscustomobject]@{ b = 1; a = @(1, 2, 3) } }
+Assert-False ((Get-RevEngObjectHash -InputObject $objA) -eq (Get-RevEngObjectHash -InputObject $objC)) 'array order still matters (it is meaningful in ARM)'
+
+$objD = [pscustomobject]@{ Kind = 'StorageV2'; Tags = [ordered]@{ env = 'dev'; owner = 'ops'; app = 'x' }; Properties = [pscustomobject]@{ b = 1; a = @(3, 1, 2) } }
+Assert-False ((Get-RevEngObjectHash -InputObject $objA) -eq (Get-RevEngObjectHash -InputObject $objD)) 'a changed tag value changes the fingerprint'
+
+$single = ConvertTo-Json -InputObject (ConvertTo-RevEngCanonicalObject -InputObject @{ list = @('only') }) -Compress
+Assert-Equal '{"list":["only"]}' $single 'a one-element array stays an array'
+
+$crossProcess = @(1..2 | ForEach-Object {
+    pwsh -NoProfile -Command "Import-Module '$((Join-Path $PSScriptRoot '../scripts/AzRgRevEng.psm1'))'; Get-RevEngObjectHash -InputObject @{ env='prod'; owner='ops'; costcenter='42'; app='x'; tier='web' }"
+})
+Assert-Equal $crossProcess[0] $crossProcess[1] 'a plain Hashtable hashes identically in two separate processes'
+
+# ---------------------------------------------------------------------------
 Test-Group 'Fingerprint resilience (the bug that made every resource look modified)'
 
 $global:AzCallCount = 0

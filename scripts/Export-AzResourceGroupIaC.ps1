@@ -237,6 +237,17 @@ if ($inventory.Count -eq 0) {
 # --- 2. Diff against previous run ----------------------------------------
 $previousState = Get-RevEngPreviousState -Path $paths.State
 $previousResources = Get-RevEngConfigValue -Config $previousState -Path 'resources' -Default (New-RevEngOrderedMap)
+
+# Hashes from an older fingerprint format are not comparable with today's, and
+# comparing them would report every resource as modified. Re-baseline instead.
+$fingerprintVersion = 2
+$previousFingerprintVersion = [int](Get-RevEngConfigValue -Config $previousState -Path 'fingerprintVersion' -Default 1)
+$rebaselined = ($previousResources.Count -gt 0 -and $previousFingerprintVersion -ne $fingerprintVersion)
+if ($rebaselined) {
+    Write-RevEngLog ("state.json was written with fingerprint format v{0}; this tool uses v{1}. This run re-baselines - drift is reported again from the next run." -f $previousFingerprintVersion, $fingerprintVersion) -Level Warn
+    $previousState['templateResources'] = New-RevEngOrderedMap
+    $previousResources = New-RevEngOrderedMap
+}
 $isBaseline = ($previousResources.Count -eq 0)
 $diff = Compare-RevEngSnapshot -Current $inventory -Previous $previousResources
 
@@ -1045,6 +1056,7 @@ if ($keepHistory) {
 # --- 9. State + cleanup ---------------------------------------------------
 Write-RevEngJsonFile -Path $paths.State -InputObject (New-RevEngOrderedMap @{
     schemaVersion     = 2
+    fingerprintVersion = $fingerprintVersion
     resourceGroupName = $ResourceGroupName
     subscriptionId    = $sourceSubscriptionId
     tenantId          = $sourceTenantId
