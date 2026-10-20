@@ -418,6 +418,27 @@ Assert-True ($port.Template['parameters'].Contains('location')) 'the location pa
 Assert-True (@($port.Findings | Where-Object { $_.Category -eq 'Environment identifier' }).Count -gt 0) 'rewrites are reported'
 Assert-True ($port.Template['resources'][0]['identity'].Contains('type')) 'the deployable identity.type survives stripping'
 
+# Real exports carry references to resources outside the exported set as
+# '<type>_<name>_externalid' parameters with a literal resource id default.
+$withExternal = @"
+{
+  "parameters": {
+    "virtualNetworks_vnet1_externalid": { "type": "String", "defaultValue": "/subscriptions/$SUB/resourceGroups/rg-network/providers/Microsoft.Network/virtualNetworks/vnet1" },
+    "sites_app1_name": { "type": "String", "defaultValue": "app1" }
+  },
+  "variables": { "workspaceId": "/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.OperationalInsights/workspaces/ws1" },
+  "resources": []
+}
+"@ | ConvertFrom-Json -AsHashtable -Depth 32
+$ext = Convert-RevEngTemplateForPortability -Template $withExternal -PortabilityConfig $portability `
+    -SourceSubscriptionId $SUB -SourceTenantId $TENANT -SourceResourceGroupName $RG -PrimaryLocation 'East US'
+$extJson = $ext.Template | ConvertTo-Json -Depth 32
+Assert-NotMatch $extJson ([regex]::Escape($SUB)) 'no literal subscription id remains in parameter defaults or variables'
+Assert-Equal "[format('/subscriptions/{0}/resourceGroups/rg-network/providers/Microsoft.Network/virtualNetworks/vnet1', subscription().subscriptionId)]" `
+    $ext.Template['parameters']['virtualNetworks_vnet1_externalid']['defaultValue'] 'an external-id parameter default becomes a runtime expression'
+Assert-Equal 'app1' $ext.Template['parameters']['sites_app1_name']['defaultValue'] 'an ordinary parameter default is untouched'
+Assert-True ($ext.Template['variables']['workspaceId'] -match 'resourceGroup\(\)\.name') 'the source resource group in a variable is rewritten too'
+
 # ---------------------------------------------------------------------------
 Test-Group 'External dependencies'
 # @() per the module's collection convention - a lone result arrives unrolled.
@@ -425,6 +446,10 @@ $deps = @(Get-RevEngExternalDependency -TemplateJson $templateJson -SourceResour
 Assert-Equal 1 $deps.Count 'the cross-RG Key Vault reference is reported'
 Assert-True ($deps[0] -match 'kv-shared') 'and it is the right one'
 Assert-NotMatch ($deps -join ' ') 'vnet1' 'same-RG references are not reported as external'
+
+$otherSub = '{"x": "/subscriptions/00000000-1111-2222-3333-444444444444/resourceGroups/' + $RG + '/providers/Microsoft.KeyVault/vaults/kv-twin"}'
+Assert-Equal 1 @(Get-RevEngExternalDependency -TemplateJson $otherSub -SourceResourceGroupName $RG -SourceSubscriptionId $SUB).Count 'a same-named resource group in another subscription is external'
+Assert-Equal 0 @(Get-RevEngExternalDependency -TemplateJson $otherSub -SourceResourceGroupName $RG).Count 'without a subscription to compare, only the RG name decides (previous behaviour)'
 
 $noDeps = @(Get-RevEngExternalDependency -TemplateJson '{"a":"b"}' -SourceResourceGroupName $RG)
 Assert-Equal 0 $noDeps.Count 'a template with no external references reports none'

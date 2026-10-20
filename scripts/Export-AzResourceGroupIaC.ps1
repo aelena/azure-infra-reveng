@@ -381,7 +381,7 @@ foreach ($l in (Test-RevEngSecretLeak -Content $mainJson -SecretConfig $secretCo
 # Scanned on the raw export, not the transformed template: by now the literal
 # subscription id has become subscription().subscriptionId, so a resource-id
 # match is no longer possible. Only resource ids are recorded, never values.
-$externalDeps = @(Get-RevEngExternalDependency -TemplateJson $rawJson -SourceResourceGroupName $ResourceGroupName)
+$externalDeps = @(Get-RevEngExternalDependency -TemplateJson $rawJson -SourceResourceGroupName $ResourceGroupName -SourceSubscriptionId $sourceSubscriptionId)
 
 if ($noiseRemoved.Count -gt 0 -or $inlineRemoved.Count -gt 0) {
     $noiseTypes = @($noiseRemoved | Group-Object Type | Sort-Object Count -Descending)

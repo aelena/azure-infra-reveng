@@ -1383,6 +1383,41 @@ function Convert-RevEngTemplateForPortability {
         $template['resources'] = $resources
     }
 
+    # Azure exports a reference to anything outside the exported set as a
+    # parameter - 'virtualNetworks_vnet_externalid' defaulting to a literal
+    # /subscriptions/<id>/... - so the source ids sit in parameter defaults and
+    # variables too. Only identifiers are rewritten there: nothing is stripped,
+    # and the location default is the source region on purpose.
+    if ($replacements.Count -gt 0) {
+        $idVisitor = {
+            param($name, $path, $node)
+            if ($node -isnot [string]) { return $null }
+            $rewritten = Convert-RevEngPortableString -Value $node -Replacements $replacements
+            if ($rewritten.Value -eq $node) { return $null }
+            $findings.Add([pscustomobject]@{
+                Severity     = 'Rewritten'
+                Category     = 'Environment identifier'
+                ResourceName = $context.ResourceName
+                ResourceType = $context.ResourceType
+                Path         = $path
+                Detail       = ('Replaced {0} with a runtime expression.' -f (@($rewritten.Hits) -join ', '))
+            })
+            return @{ Handled = $true; Value = $rewritten.Value }
+        }
+        if (Test-RevEngHasKey $template 'parameters') {
+            $context.ResourceName = '(parameters)'; $context.ResourceType = '(parameters)'
+            foreach ($p in @($template['parameters'].Keys)) {
+                $def = $template['parameters'][$p]
+                if (-not (Test-RevEngHasKey $def 'defaultValue')) { continue }
+                $def['defaultValue'] = (Invoke-RevEngTreeVisit -Node $def['defaultValue'] -Path "parameters.$p.defaultValue" -Name 'defaultValue' -Visitor $idVisitor)['Value']
+            }
+        }
+        if (Test-RevEngHasKey $template 'variables') {
+            $context.ResourceName = '(variables)'; $context.ResourceType = '(variables)'
+            $template['variables'] = (Invoke-RevEngTreeVisit -Node $template['variables'] -Path 'variables' -Name '' -Visitor $idVisitor)['Value']
+        }
+    }
+
     return @{
         Template = $template
         Findings = $findings.ToArray()
@@ -1397,12 +1432,16 @@ function Get-RevEngExternalDependency {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$TemplateJson,
-        [Parameter(Mandatory)][string]$SourceResourceGroupName
+        [Parameter(Mandatory)][string]$SourceResourceGroupName,
+        # Optional: when given, a same-named resource group in ANOTHER
+        # subscription is external too.
+        [string]$SourceSubscriptionId
     )
     $found = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    $rx = '(?i)/subscriptions/[0-9a-f-]{36}/resourceGroups/([^/"''\\\[\]]+)/providers/([^"''\\\[\]]+)'
+    $rx = '(?i)/subscriptions/([0-9a-f-]{36})/resourceGroups/([^/"''\\\[\]]+)/providers/([^"''\\\[\]]+)'
     foreach ($m in [regex]::Matches($TemplateJson, $rx)) {
-        if ($m.Groups[1].Value -ine $SourceResourceGroupName) {
+        $otherSub = $SourceSubscriptionId -and ($m.Groups[1].Value -ine $SourceSubscriptionId)
+        if ($otherSub -or $m.Groups[2].Value -ine $SourceResourceGroupName) {
             [void]$found.Add($m.Value)
         }
     }

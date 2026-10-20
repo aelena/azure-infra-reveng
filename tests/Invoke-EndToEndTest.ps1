@@ -196,7 +196,11 @@ function global:Export-AzResourceGroup {
         $bodies += $body
         switch ($r.ResourceType) {
             'Microsoft.Storage/storageAccounts' { $params += """storageAccounts_$($r.Name)_name"": { ""type"": ""String"", ""defaultValue"": ""$($r.Name)"" }" }
-            'Microsoft.Web/sites'               { $params += """sites_$($r.Name)_name"": { ""type"": ""String"", ""defaultValue"": ""$($r.Name)"" }" }
+            'Microsoft.Web/sites'               {
+                $params += """sites_$($r.Name)_name"": { ""type"": ""String"", ""defaultValue"": ""$($r.Name)"" }"
+                # How Azure exports a reference to something outside the exported set.
+                $params += """serverfarms_shared_externalid"": { ""type"": ""String"", ""defaultValue"": ""/subscriptions/$global:SUB/resourceGroups/rg-e2e-shared/providers/Microsoft.Web/serverfarms/plan-shared"" }"
+            }
         }
     }
     $json = @"
