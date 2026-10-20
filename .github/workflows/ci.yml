@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Bicep CLI (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -sSLo /usr/local/bin/bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
+          chmod +x /usr/local/bin/bicep
+          bicep --version
+
+      - name: Install the Bicep CLI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          az bicep install
+          & "$HOME/.azure/bin/bicep.exe" --version
+
+      - name: Unit tests (no Azure)
+        shell: pwsh
+        run: ./tests/Invoke-Tests.ps1
+
+      - name: End-to-end tests (mocked Azure)
+        shell: pwsh
+        run: ./tests/Invoke-EndToEndTest.ps1

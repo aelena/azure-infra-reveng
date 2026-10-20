@@ -53,6 +53,7 @@ azure-audit/
 # Editor / OS / tooling noise
 # ---------------------------------------------------------------------------
 .claude/settings.local.json
+graft/
 .vscode/
 .idea/
 *.swp
